@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.*
+!.env-example
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+__pypackages__/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+logs/
+*.log
+
+# Runtime/session files
+session/*
+!session/default.png
+*.session
+*.session-journal
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
