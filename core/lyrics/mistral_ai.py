@@ -26,9 +26,12 @@ from utils.http_session import init_session
 from config import Settings
 
 try:
-    from mistralai import Mistral as MistralClient
+    from mistralai.client import Mistral as MistralClient
 except ImportError:
-    MistralClient = None
+    try:
+        from mistralai import Mistral as MistralClient
+    except ImportError:
+        MistralClient = None
 
 _MISTRAL_LOG_PATH = os.path.join(DIRS["LOGS"], "GENIUS_MISTRAL_FINAL_SELECTION.log")
 _MISTRAL_MODELS_CACHE_PATH = os.path.join(DIRS["SESSION"], "mistral", "mistral_models_list.json")
