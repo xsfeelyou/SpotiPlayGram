@@ -6,7 +6,7 @@ import re
 import hashlib
 from collections import OrderedDict
 import aiohttp
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Literal, get_args, get_origin
 from constants import (
     DIRS,
     ERROR_AUTH_MISTRAL_API_KEY_MISSING,
@@ -45,19 +45,36 @@ _MISTRAL_FINAL_SELECTION_JSON_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_MISTRAL_REASONING_PROBE_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "ok": {"type": "string"},
+    },
+    "required": ["ok"],
+    "additionalProperties": False,
+}
+
 __all__ = [
     "get_mistral_models_chain",
     "read_mistral_model",
     "write_mistral_model",
     "choose_genius_candidate_with_mistral",
     "is_model_reasoning",
+    "get_model_reasoning_modes",
+    "is_model_reasoning_mode_valid",
     "update_models_cache",
     "check_model_reasoning_type",
+    "check_model_reasoning_capabilities",
     "ensure_selected_models_cached",
+    "_format_model_spec",
 ]
 
 _MISTRAL_CHOICE_CACHE_TTL_SECONDS: float = 3600.0
 _MISTRAL_CHOICE_CACHE_MAX_SIZE: int = int(_MISTRAL_CHOICE_CACHE_TTL_SECONDS)
+_MISTRAL_FINAL_SELECTION_MAX_TOKENS: int = 16
+_MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS: int = 32768
+_MISTRAL_MODELS_CACHE_SCHEMA_VERSION: int = 2
+_MISTRAL_MODEL_CAPABILITY_CONCURRENCY: int = 100
 _MISTRAL_CHOICE_CACHE: "OrderedDict[str, Tuple[float, Optional[int], bool]]" = OrderedDict()
 _MISTRAL_CHOICE_INFLIGHT: Dict[str, asyncio.Task] = {}
 
@@ -151,6 +168,133 @@ def _split_model_ids(value: Any) -> List[str]:
     text = str(value)
     return [m.strip() for m in re.split(r"[\s,]+", text) if m.strip()]
 
+def _parse_model_spec_token(value: Any) -> Tuple[str, Optional[str]]:
+    if isinstance(value, dict):
+        model = str(value.get("id") or value.get("model") or "").strip()
+        mode_raw = value.get("reasoning_effort")
+        if mode_raw is None:
+            mode_raw = value.get("reasoning_mode")
+        mode = str(mode_raw).strip().lower() if mode_raw is not None else ""
+        return model, mode or None
+    text = str(value).strip()
+    if "=" not in text:
+        return text, None
+    model, mode = text.split("=", 1)
+    return model.strip(), (mode.strip().lower() or None)
+
+def _format_model_spec(model_id: str, reasoning_mode: Optional[str] = None) -> str:
+    model = str(model_id or "").strip()
+    mode = str(reasoning_mode or "").strip().lower()
+    if model and mode:
+        return f"{model}={mode}"
+    return model
+
+def _split_model_specs(value: Any) -> List[Tuple[str, Optional[str]]]:
+    if value is None:
+        return []
+    raw_items: List[Any]
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = _split_model_ids(value)
+    specs: List[Tuple[str, Optional[str]]] = []
+    for item in raw_items:
+        model, mode = _parse_model_spec_token(item)
+        if model:
+            specs.append((model, mode))
+    return specs
+
+def _split_model_spec_strings(value: Any) -> List[str]:
+    return [_format_model_spec(model, mode) for model, mode in _split_model_specs(value)]
+
+def _get_model_info_from_models(models: Any, model_id: str) -> Optional[Dict[str, Any]]:
+    model, _ = _parse_model_spec_token(model_id)
+    if not isinstance(models, dict):
+        return None
+    if model in models and isinstance(models[model], dict):
+        return models[model]
+    for info in models.values():
+        if not isinstance(info, dict):
+            continue
+        aliases = info.get("aliases", [])
+        if isinstance(aliases, list) and model in aliases:
+            return info
+    return None
+
+def _normalize_reasoning_effort_values(raw_modes: Any) -> List[str]:
+    if not isinstance(raw_modes, list):
+        return []
+    modes: List[str] = []
+    seen = set()
+    for raw in raw_modes:
+        mode = str(raw).strip().lower()
+        if mode and mode not in seen:
+            seen.add(mode)
+            modes.append(mode)
+    return modes
+
+def _merge_reasoning_effort_values(*raw_values: Any) -> List[str]:
+    modes: List[str] = []
+    seen = set()
+    for raw in raw_values:
+        for mode in _normalize_reasoning_effort_values(raw):
+            if mode not in seen:
+                seen.add(mode)
+                modes.append(mode)
+    return modes
+
+def _get_model_reasoning_modes_from_info(info: Optional[Dict[str, Any]]) -> List[str]:
+    if not info:
+        return []
+    return _merge_reasoning_effort_values(info.get("reasoning_efforts"), info.get("reasoning_modes"))
+
+def _merge_model_capabilities_with_known(
+    capabilities: Dict[str, Any],
+    previous_info: Optional[Dict[str, Any]],
+    known_reasoning: Optional[bool],
+    known_efforts: List[str],
+) -> Dict[str, Any]:
+    merged = dict(capabilities)
+    previous_efforts = []
+    if known_reasoning is not False or known_efforts:
+        previous_efforts = _get_model_reasoning_modes_from_info(previous_info)
+    efforts = _merge_reasoning_effort_values(
+        merged.get("reasoning_efforts"),
+        merged.get("reasoning_modes"),
+        known_efforts,
+        previous_efforts,
+    )
+    active_efforts = any(mode != "none" for mode in efforts)
+    if efforts:
+        merged["reasoning_efforts"] = efforts
+    else:
+        merged["reasoning_efforts"] = []
+    if active_efforts:
+        merged["reasoning"] = True
+        merged["reasoning_type"] = "adjustable"
+    elif known_reasoning is True or merged.get("reasoning") is True:
+        merged["reasoning"] = True
+        reasoning_type = str(merged.get("reasoning_type") or "").strip().lower()
+        if not reasoning_type or reasoning_type == "none":
+            merged["reasoning_type"] = "native"
+    elif known_reasoning is False:
+        merged["reasoning"] = bool(merged.get("reasoning", False))
+    return merged
+
+def _sanitize_model_specs_with_cache(value: Any, cache: Dict[str, Any]) -> List[str]:
+    models = cache.get("available_models", {}) if isinstance(cache, dict) else {}
+    specs: List[str] = []
+    seen = set()
+    for model, mode in _split_model_specs(value):
+        info = _get_model_info_from_models(models, model)
+        valid_modes = _get_model_reasoning_modes_from_info(info)
+        normalized_mode = mode if mode and mode in valid_modes else None
+        spec = _format_model_spec(model, normalized_mode)
+        if spec and spec not in seen:
+            seen.add(spec)
+            specs.append(spec)
+    return specs
+
 def _is_genius_detailed_log() -> bool:
     st = get_settings()
     return bool(st.genius_detailed_log)
@@ -161,6 +305,8 @@ def _write_mistral_log(
     model: str,
     usage: Optional[Dict[str, int]] = None,
     model_type: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    prompt_mode: Optional[str] = None,
 ) -> None:
     lines: List[str] = []
     lines.append("=" * 80)
@@ -170,7 +316,12 @@ def _write_mistral_log(
 
     lines.append(f"Model: {model}")
     if model_type:
-        type_json = json.dumps({"model_type": model_type}, ensure_ascii=False)
+        type_data = {"model_type": model_type}
+        if reasoning_effort:
+            type_data["reasoning_effort"] = reasoning_effort
+        if prompt_mode:
+            type_data["prompt_mode"] = prompt_mode
+        type_json = json.dumps(type_data, ensure_ascii=False)
         lines.append(type_json)
     lines.append("")
     lines.append("-" * 40)
@@ -212,10 +363,13 @@ def _write_mistral_log(
 
 def read_mistral_model() -> str:
     cache = _read_models_cache()
-    models = _split_model_ids(cache.get("selected_models"))
+    models = _split_model_spec_strings(cache.get("selected_models"))
     if models:
         return ", ".join(models)
     st = get_settings()
+    models = _split_model_spec_strings(st.mistral_model)
+    if models:
+        return ", ".join(models)
     return st.mistral_model
 
 def write_mistral_model(new_model: str) -> bool:
@@ -223,11 +377,11 @@ def write_mistral_model(new_model: str) -> bool:
     nm = (new_model or "").strip()
     if not nm:
         return False
-    new_list = _split_model_ids(nm)
+    new_list = _split_model_spec_strings(nm)
     if not new_list:
         return False
     cur_val = cache.get("selected_models", [])
-    cur_list = _split_model_ids(cur_val)
+    cur_list = _split_model_spec_strings(cur_val)
 
     if new_list == cur_list:
         return False
@@ -241,7 +395,7 @@ def get_mistral_models_chain() -> List[str]:
     cache = _read_models_cache()
     val = cache.get("selected_models")
     chain: List[str] = []
-    parts = _split_model_ids(val)
+    parts = _split_model_spec_strings(val)
     seen = set()
     for p in parts:
         if p not in seen:
@@ -250,7 +404,9 @@ def get_mistral_models_chain() -> List[str]:
 
     if not chain:
         st = get_settings()
-        chain = [st.mistral_model]
+        chain = _split_model_spec_strings(st.mistral_model)
+        if not chain and st.mistral_model:
+            chain = [st.mistral_model]
     return chain
 
 def _read_models_cache() -> Dict[str, Any]:
@@ -280,35 +436,158 @@ def _coerce_to_text(value: Any) -> str:
         return ""
     if isinstance(value, str):
         return value
+    if isinstance(value, dict):
+        chunk_type = str(value.get("type") or "").strip().lower()
+        if chunk_type == "thinking":
+            return ""
+        t = value.get("text") or value.get("content") or value.get("data")
+        return "" if t is None else str(t)
     if isinstance(value, list):
         parts: List[str] = []
         for el in value:
             if isinstance(el, str):
                 parts.append(el)
             elif isinstance(el, dict):
+                chunk_type = str(el.get("type") or "").strip().lower()
+                if chunk_type == "thinking":
+                    continue
                 t = el.get("text") or el.get("content") or el.get("data")
                 if t is not None:
                     parts.append(str(t))
             else:
-                parts.append(str(el))
+                chunk_type = str(getattr(el, "type", "") or "").strip().lower()
+                if chunk_type == "thinking":
+                    continue
+                t = getattr(el, "text", None)
+                if t is None:
+                    t = getattr(el, "content", None)
+                if t is None:
+                    t = getattr(el, "data", None)
+                if t is not None:
+                    parts.append(str(t))
+                elif not chunk_type:
+                    parts.append(str(el))
         return "".join(parts)
+    chunk_type = str(getattr(value, "type", "") or "").strip().lower()
+    if chunk_type == "thinking":
+        return ""
+    t = getattr(value, "text", None)
+    if t is None:
+        t = getattr(value, "content", None)
+    if t is None:
+        t = getattr(value, "data", None)
+    if t is not None:
+        return str(t)
     return str(value)
+
+def _load_mistral_json_object(out_text: str) -> Any:
+    try:
+        return json.loads(out_text)
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        parsed_idx_object: Optional[Dict[str, Any]] = None
+        for pos, ch in enumerate(out_text):
+            if ch != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(out_text[pos:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "idx" in candidate:
+                parsed_idx_object = candidate
+        if parsed_idx_object is not None:
+            return parsed_idx_object
+        raise original_error
+
+def _extract_literal_strings(type_obj: Any) -> List[str]:
+    values: List[str] = []
+    origin = get_origin(type_obj)
+    if origin is Literal:
+        for arg in get_args(type_obj):
+            if isinstance(arg, str):
+                values.append(arg)
+        return values
+    for arg in get_args(type_obj):
+        values.extend(_extract_literal_strings(arg))
+    return values
+
+def get_available_reasoning_efforts() -> List[str]:
+    reasoning_effort_type: Any = None
+    try:
+        from mistralai.client.models.reasoningeffort import ReasoningEffort
+        reasoning_effort_type = ReasoningEffort
+    except ImportError:
+        try:
+            from mistralai.models.reasoningeffort import ReasoningEffort
+            reasoning_effort_type = ReasoningEffort
+        except ImportError:
+            reasoning_effort_type = None
+    if reasoning_effort_type is None:
+        return []
+    values: List[str] = []
+    seen = set()
+    for value in _extract_literal_strings(reasoning_effort_type):
+        normalized = value.strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            values.append(normalized)
+    return values
 
 def _extract_mistral_content_text(resp: Any) -> str:
     raw: Any = None
+    if isinstance(resp, dict):
+        choices = resp.get("choices")
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0]
+            if isinstance(first_choice, dict):
+                msg = first_choice.get("message") or {}
+                if isinstance(msg, dict):
+                    raw = msg.get("content")
     choices = getattr(resp, "choices", None)
-    if isinstance(choices, list) and choices:
+    if raw is None and isinstance(choices, list) and choices:
         msg = getattr(choices[0], "message", None)
         raw = getattr(msg, "content", None) if msg is not None else None
     if raw is None:
         raw = resp
     return _coerce_to_text(raw).strip()
 
+def _format_mistral_error_message(value: Any, max_len: int = 160) -> str:
+    if isinstance(value, BaseException):
+        text = str(value).strip() or value.__class__.__name__
+    else:
+        text = "" if value is None else str(value)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = " ".join(text.split())
+    if not text:
+        text = "mistral request failed"
+    if len(text) > max_len:
+        text = text[:max_len - 3].rstrip() + "..."
+    return text
+
+def _mistral_response_has_thinking(resp: Any) -> bool:
+    def walk(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, dict):
+            if str(value.get("type") or "").strip().lower() == "thinking":
+                return True
+            return any(walk(v) for v in value.values())
+        if isinstance(value, list):
+            return any(walk(v) for v in value)
+        if str(getattr(value, "type", "") or "").strip().lower() == "thinking":
+            return True
+        thinking = getattr(value, "thinking", None)
+        if thinking is not None:
+            return True
+        return False
+
+    return walk(resp)
+
 def _parse_mistral_idx(out_text: str) -> tuple[Optional[int], bool, Optional[str]]:
     if not out_text:
         return None, False, "empty response"
     try:
-        parsed = json.loads(out_text)
+        parsed = _load_mistral_json_object(out_text)
     except json.JSONDecodeError:
         return None, False, "invalid content: not json"
     if not isinstance(parsed, dict):
@@ -327,6 +606,7 @@ def _parse_mistral_idx(out_text: str) -> tuple[Optional[int], bool, Optional[str
     return idx_int, False, None
 
 def _log_mistral_exception(message: str, model: str) -> None:
+    message = _format_mistral_error_message(message)
     low = message.lower()
     if "401" in low or "unauthorized" in low or "forbidden" in low or "invalid api key" in low:
         _safe_log_error(ERROR_MISTRAL_API_KEY_INVALID)
@@ -336,88 +616,331 @@ def _log_mistral_exception(message: str, model: str) -> None:
         _safe_log_error(ERROR_MISTRAL_REQUEST, message)
     _safe_log_error(ERROR_MISTRAL_FINAL_SELECTION, message)
 
-def is_model_reasoning(model_id: str) -> bool:
+async def _await_mistral_selection_task(task: asyncio.Task) -> Tuple[Optional[int], bool]:
+    try:
+        return await asyncio.wait_for(task, timeout=float(MISTRAL_TIMEOUT_SECONDS))
+    except asyncio.TimeoutError:
+        try:
+            task.cancel()
+        except RuntimeError:
+            pass
+        await asyncio.gather(task, return_exceptions=True)
+        _safe_log_error(ERROR_MISTRAL_TIMEOUT, "selection", MISTRAL_TIMEOUT_SECONDS)
+        return None, False
+
+def _get_cached_model_info(model_id: str) -> Optional[Dict[str, Any]]:
     cache = _read_models_cache()
     models = cache.get("available_models", {})
-    if model_id in models:
-        return models[model_id].get("reasoning", False)
-    for mid, info in models.items():
-        aliases = info.get("aliases", [])
-        if model_id in aliases:
-            return info.get("reasoning", False)
+    return _get_model_info_from_models(models, model_id)
 
-    return False
+def is_model_reasoning(model_id: str) -> bool:
+    info = _get_cached_model_info(model_id)
+    if not info:
+        return False
+    modes = info.get("reasoning_efforts") or info.get("reasoning_modes") or []
+    if isinstance(modes, list):
+        for raw_mode in modes:
+            mode = str(raw_mode).strip().lower()
+            if mode and mode != "none":
+                return True
+    return bool(info.get("reasoning", False) or info.get("prompt_mode_reasoning", False))
 
-async def check_model_reasoning_type(model_id: str, api_key: str, max_retries: int = 3) -> bool:
+def get_model_reasoning_type(model_id: str) -> str:
+    info = _get_cached_model_info(model_id)
+    if not info:
+        return "none"
+    reasoning_type = str(info.get("reasoning_type") or "").strip().lower()
+    if reasoning_type:
+        return reasoning_type
+    modes = _get_model_reasoning_modes_from_info(info)
+    if any(mode != "none" for mode in modes):
+        return "adjustable"
+    if info.get("prompt_mode_reasoning", False):
+        return "prompt_mode"
+    if info.get("reasoning", False):
+        return "native"
+    return "none"
+
+def get_model_reasoning_modes(model_id: str) -> List[str]:
+    info = _get_cached_model_info(model_id)
+    return _get_model_reasoning_modes_from_info(info)
+
+def is_model_reasoning_mode_valid(model_id: str, reasoning_mode: Optional[str]) -> bool:
+    mode = str(reasoning_mode or "").strip().lower()
+    if not mode:
+        return True
+    modes = get_model_reasoning_modes(model_id)
+    return mode in modes
+
+async def _check_mistral_chat_payload(
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout: aiohttp.ClientTimeout,
+    max_retries: int,
+) -> bool:
+    ok, _, _ = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
+    return ok
+
+async def _probe_mistral_chat_payload(
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout: aiohttp.ClientTimeout,
+    max_retries: int,
+) -> Tuple[bool, str, bool]:
     url = "https://api.mistral.ai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "Content-Type": "application/json"}
-    payload = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": "1+1="}],
-        "max_tokens": 1,
-        "temperature": 0,
-        "prompt_mode": "reasoning",
-    }
-    session = init_session()
-    timeout = aiohttp.ClientTimeout(total=15.0)
     for attempt in range(max_retries):
         try:
             async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
                 if resp.status == 200:
-                    return True
-                elif resp.status == 400:
-                    return False
-                elif resp.status == 429:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
+                        data = await resp.text()
+                    return True, _extract_mistral_content_text(data), _mistral_response_has_thinking(data)
+                if resp.status in (400, 404, 422):
+                    return False, "", False
+                if resp.status == 429:
                     await asyncio.sleep(1.0 * (attempt + 1))
                     continue
-                elif resp.status >= 500:
+                if resp.status >= 500:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
-                else:
-                    await asyncio.sleep(0.5)
-                    continue
+                return False, "", False
         except asyncio.TimeoutError:
             await asyncio.sleep(1.0 * (attempt + 1))
             continue
         except (aiohttp.ClientError, OSError):
             await asyncio.sleep(0.5)
             continue
-    return False
+    return False, "", False
+
+def _is_probe_json_valid(out_text: str) -> bool:
+    if not out_text:
+        return False
+    try:
+        parsed = _load_mistral_json_object(out_text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict)
+
+async def check_model_reasoning_capabilities(
+    model_id: str,
+    api_key: str,
+    max_retries: int = 3,
+    known_reasoning: Optional[bool] = None,
+    known_efforts: Optional[List[str]] = None,
+    timeout_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "Content-Type": "application/json"}
+    session = init_session()
+    timeout = aiohttp.ClientTimeout(total=float(timeout_seconds if timeout_seconds is not None else MISTRAL_TIMEOUT_SECONDS))
+    efforts: List[str] = []
+    default_has_thinking = False
+    effort_candidates: List[str] = []
+    seen_effort_candidates = set()
+    raw_effort_candidates: List[str] = list(known_efforts or [])
+    if known_reasoning is not False:
+        raw_effort_candidates.extend(get_available_reasoning_efforts())
+    for raw_effort in raw_effort_candidates:
+        effort = str(raw_effort).strip().lower()
+        if effort and effort not in seen_effort_candidates:
+            seen_effort_candidates.add(effort)
+            effort_candidates.append(effort)
+    for effort in effort_candidates:
+        payload = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": "Return only a JSON object."},
+                {"role": "user", "content": "Return {\"ok\":\"yes\"}."},
+            ],
+            "max_tokens": _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS,
+            "temperature": 0,
+            "reasoning_effort": effort,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reasoning_probe",
+                    "schema": _MISTRAL_REASONING_PROBE_JSON_SCHEMA,
+                },
+            },
+        }
+        ok, out_text, _ = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
+        if ok and _is_probe_json_valid(out_text):
+            efforts.append(effort)
+    has_active_reasoning_effort = any(effort != "none" for effort in efforts)
+    if known_reasoning is not False:
+        payload = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": "Return only a JSON object."},
+                {"role": "user", "content": "Return {\"ok\":\"yes\"}."},
+            ],
+            "max_tokens": _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS,
+            "temperature": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reasoning_probe",
+                    "schema": _MISTRAL_REASONING_PROBE_JSON_SCHEMA,
+                },
+            },
+        }
+        ok, out_text, has_thinking = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
+        default_has_thinking = bool(ok and _is_probe_json_valid(out_text) and has_thinking)
+    prompt_mode_reasoning = False
+    if not has_active_reasoning_effort and not default_has_thinking and known_reasoning is not False:
+        payload = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": "Return only a JSON object."},
+                {"role": "user", "content": "Return {\"ok\":\"yes\"}."},
+            ],
+            "max_tokens": _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS,
+            "temperature": 0,
+            "prompt_mode": "reasoning",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reasoning_probe",
+                    "schema": _MISTRAL_REASONING_PROBE_JSON_SCHEMA,
+                },
+            },
+        }
+        ok, out_text, _ = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
+        prompt_mode_reasoning = bool(ok and _is_probe_json_valid(out_text))
+    if default_has_thinking:
+        reasoning_type = "native"
+        efforts = []
+    elif has_active_reasoning_effort:
+        reasoning_type = "adjustable"
+    elif known_reasoning is True:
+        reasoning_type = "native"
+    elif prompt_mode_reasoning:
+        reasoning_type = "prompt_mode"
+    else:
+        reasoning_type = "none"
+    return {
+        "reasoning": reasoning_type != "none",
+        "reasoning_type": reasoning_type,
+        "reasoning_efforts": efforts,
+        "default_has_thinking": default_has_thinking,
+        "prompt_mode_reasoning": prompt_mode_reasoning,
+    }
+
+async def check_model_reasoning_type(model_id: str, api_key: str, max_retries: int = 3) -> bool:
+    capabilities = await check_model_reasoning_capabilities(model_id, api_key, max_retries=max_retries)
+    return bool(capabilities.get("reasoning", False))
 
 async def update_models_cache(
     models_data: List[Dict[str, Any]],
     api_key: str,
-    force_recheck: bool = False
+    force_recheck: bool = False,
+    max_retries: int = 3,
+    timeout_seconds: Optional[float] = None,
+    concurrency: int = _MISTRAL_MODEL_CAPABILITY_CONCURRENCY,
 ) -> Dict[str, Any]:
     full_cache = _read_models_cache()
-    existing_selected = _split_model_ids(full_cache.get("selected_models", []))
+    existing_selected = _split_model_spec_strings(full_cache.get("selected_models", []))
+    full_cached_models_raw = full_cache.get("available_models", {})
+    full_cached_models = full_cached_models_raw if isinstance(full_cached_models_raw, dict) else {}
 
     cache = full_cache if not force_recheck else {}
-    cached_models = cache.get("available_models", {})
+    cached_models_raw = cache.get("available_models", {})
+    cached_models = cached_models_raw if isinstance(cached_models_raw, dict) else {}
 
     new_models: Dict[str, Any] = {}
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
-    for item in models_data:
+    async def build_model_cache_item(item: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
         model_id = item.get("id")
         if not model_id:
-            continue
+            return None
 
         aliases = item.get("aliases", [])
-        if model_id in cached_models and not force_recheck:
-            new_models[model_id] = cached_models[model_id]
-            new_models[model_id]["aliases"] = aliases
-        else:
-            is_reasoning = await check_model_reasoning_type(model_id, api_key)
-            new_models[model_id] = {
+        if not isinstance(aliases, list):
+            aliases = []
+        known_reasoning_raw = item.get("reasoning")
+        known_reasoning = known_reasoning_raw if isinstance(known_reasoning_raw, bool) else None
+        known_efforts_raw = item.get("reasoning_efforts") or item.get("reasoning_modes") or []
+        current_known_efforts = _normalize_reasoning_effort_values(known_efforts_raw)
+        known_efforts = current_known_efforts
+        previous_info = _get_model_info_from_models(full_cached_models, model_id)
+        if previous_info:
+            previous_reasoning_raw = previous_info.get("reasoning")
+            if known_reasoning is None and isinstance(previous_reasoning_raw, bool):
+                known_reasoning = previous_reasoning_raw
+            if known_reasoning is not False or current_known_efforts:
+                known_efforts = _merge_reasoning_effort_values(
+                    known_efforts,
+                    previous_info.get("reasoning_efforts"),
+                    previous_info.get("reasoning_modes"),
+                )
+        async with semaphore:
+            if model_id in cached_models and not force_recheck:
+                cached_info = dict(cached_models[model_id])
+                cached_info["aliases"] = aliases
+                if "reasoning_efforts" not in cached_info and "reasoning_modes" in cached_info:
+                    cached_info["reasoning_efforts"] = cached_info.get("reasoning_modes", [])
+                cached_info["reasoning_efforts"] = _merge_reasoning_effort_values(
+                    cached_info.get("reasoning_efforts"),
+                    cached_info.get("reasoning_modes"),
+                    known_efforts,
+                )
+                if "reasoning_type" not in cached_info or "prompt_mode_reasoning" not in cached_info:
+                    capabilities = await check_model_reasoning_capabilities(
+                        model_id,
+                        api_key,
+                        max_retries=max_retries,
+                        known_reasoning=known_reasoning,
+                        known_efforts=known_efforts,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    cached_info.update(_merge_model_capabilities_with_known(
+                        capabilities,
+                        cached_info,
+                        known_reasoning,
+                        known_efforts,
+                    ))
+                elif any(mode != "none" for mode in cached_info["reasoning_efforts"]):
+                    cached_info["reasoning"] = True
+                    cached_info["reasoning_type"] = "adjustable"
+                elif known_reasoning is True:
+                    cached_info["reasoning"] = True
+                return model_id, cached_info
+            capabilities = await check_model_reasoning_capabilities(
+                model_id,
+                api_key,
+                max_retries=max_retries,
+                known_reasoning=known_reasoning,
+                known_efforts=known_efforts,
+                timeout_seconds=timeout_seconds,
+            )
+            capabilities = _merge_model_capabilities_with_known(
+                capabilities,
+                previous_info,
+                known_reasoning,
+                known_efforts,
+            )
+            return model_id, {
                 "aliases": aliases,
-                "reasoning": is_reasoning
+                **capabilities,
             }
-    if existing_selected:
-        final_selected = existing_selected
-    else:
+
+    results = await asyncio.gather(*(build_model_cache_item(item) for item in models_data))
+    for result in results:
+        if result is None:
+            continue
+        model_id, model_info = result
+        new_models[model_id] = model_info
+    if not existing_selected:
         st = get_settings()
-        final_selected = _split_model_ids(st.mistral_model)
+        existing_selected = _split_model_spec_strings(st.mistral_model)
+    temp_cache = {"available_models": new_models}
+    final_selected = _sanitize_model_specs_with_cache(existing_selected, temp_cache)
     new_cache = {
+        "schema_version": _MISTRAL_MODELS_CACHE_SCHEMA_VERSION,
         "selected_models": final_selected,
         "available_models": new_models,
     }
@@ -432,26 +955,79 @@ async def ensure_selected_models_cached(api_key: str) -> None:
     current_models_str = read_mistral_model()
     cache = _read_models_cache()
     cached_models = cache.get("available_models", {})
-    models_list = _split_model_ids(current_models_str)
-    models_to_check = []
-    for model_id in models_list:
-        if model_id not in cached_models:
-            found = False
+    cache_schema_outdated = cache.get("schema_version") != _MISTRAL_MODELS_CACHE_SCHEMA_VERSION
+    models_list = _split_model_specs(current_models_str)
+    models_to_check: List[Tuple[str, str]] = []
+    seen_check_keys = set()
+    for model_id, _ in models_list:
+        cache_key: Optional[str] = model_id if model_id in cached_models else None
+        if cache_key is None:
             for mid, info in cached_models.items():
-                if model_id in info.get("aliases", []):
-                    found = True
+                if not isinstance(info, dict):
+                    continue
+                aliases = info.get("aliases", [])
+                if isinstance(aliases, list) and model_id in aliases:
+                    cache_key = mid
                     break
-            if not found:
-                models_to_check.append(model_id)
+
+        if cache_key is None:
+            cache_key = model_id
+            needs_check = True
+        else:
+            info = cached_models.get(cache_key)
+            needs_check = (
+                cache_schema_outdated
+                or
+                not isinstance(info, dict)
+                or "reasoning_type" not in info
+                or ("reasoning_efforts" not in info and "reasoning_modes" not in info)
+                or "prompt_mode_reasoning" not in info
+            )
+
+        if needs_check and cache_key not in seen_check_keys:
+            seen_check_keys.add(cache_key)
+            models_to_check.append((cache_key, model_id))
 
     if models_to_check:
-        for model_id in models_to_check:
-            is_reasoning = await check_model_reasoning_type(model_id, api_key)
-            cached_models[model_id] = {
-                "aliases": [],
-                "reasoning": is_reasoning
+        for cache_key, model_id in models_to_check:
+            cached_info = cached_models.get(cache_key)
+            aliases = []
+            known_reasoning: Optional[bool] = None
+            known_efforts: List[str] = []
+            if isinstance(cached_info, dict):
+                aliases_raw = cached_info.get("aliases", [])
+                if isinstance(aliases_raw, list):
+                    aliases = aliases_raw
+                if cache_key != model_id and model_id not in aliases:
+                    aliases.append(model_id)
+                known_reasoning_raw = cached_info.get("reasoning")
+                if isinstance(known_reasoning_raw, bool):
+                    known_reasoning = known_reasoning_raw
+                known_efforts_raw = cached_info.get("reasoning_efforts") or cached_info.get("reasoning_modes") or []
+                known_efforts = _normalize_reasoning_effort_values(known_efforts_raw)
+            capabilities = await check_model_reasoning_capabilities(
+                model_id,
+                api_key,
+                known_reasoning=known_reasoning,
+                known_efforts=known_efforts,
+            )
+            capabilities = _merge_model_capabilities_with_known(
+                capabilities,
+                cached_info if isinstance(cached_info, dict) else None,
+                known_reasoning,
+                known_efforts,
+            )
+            cached_models[cache_key] = {
+                "aliases": aliases,
+                **capabilities,
             }
         cache["available_models"] = cached_models
+    if models_to_check or cache_schema_outdated:
+        cache["schema_version"] = _MISTRAL_MODELS_CACHE_SCHEMA_VERSION
+        cache["available_models"] = cached_models
+        sanitized_selected = _sanitize_model_specs_with_cache(cache.get("selected_models", []), cache)
+        if sanitized_selected:
+            cache["selected_models"] = sanitized_selected
         _write_models_cache(cache)
 
 async def choose_genius_candidate_with_mistral(
@@ -484,7 +1060,7 @@ async def choose_genius_candidate_with_mistral(
         inflight = _MISTRAL_CHOICE_INFLIGHT.get(cache_key)
         if inflight is not None:
             try:
-                return await inflight
+                return await _await_mistral_selection_task(inflight)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -562,18 +1138,25 @@ async def choose_genius_candidate_with_mistral(
     async def _run_selection() -> Tuple[Optional[int], bool]:
         start_logged = False
         async with MistralClient(api_key=api_key) as mc:
-            for idx_model, model in enumerate(chain):
+            for idx_model, model_spec in enumerate(chain):
+                model, selected_reasoning_effort = _parse_model_spec_token(model_spec)
+                if not model:
+                    continue
                 messages = [
                     {"role": "system", "content": sys_content},
                     {"role": "user", "content": user_content},
                 ]
                 model_is_reasoning = is_model_reasoning(model)
-                current_model_type = "Reasoning" if model_is_reasoning else "Non Reasoning"
+                model_reasoning_type = get_model_reasoning_type(model)
+                prompt_mode_value: Optional[str] = None
+                model_reasoning_modes = get_model_reasoning_modes(model)
+                if selected_reasoning_effort and selected_reasoning_effort not in model_reasoning_modes:
+                    selected_reasoning_effort = None
                 chat_kwargs: Dict[str, Any] = {
                     "model": model,
                     "messages": messages,
                     "stream": False,
-                    "max_tokens": 8,
+                    "max_tokens": _MISTRAL_FINAL_SELECTION_MAX_TOKENS,
                     "temperature": 0,
                     "response_format": {
                         "type": "json_schema",
@@ -583,11 +1166,27 @@ async def choose_genius_candidate_with_mistral(
                         },
                     },
                 }
-                if model_is_reasoning:
+                if selected_reasoning_effort:
+                    chat_kwargs["reasoning_effort"] = selected_reasoning_effort
+                elif model_reasoning_type == "prompt_mode":
+                    prompt_mode_value = "reasoning"
+                if prompt_mode_value:
                     chat_kwargs["prompt_mode"] = "reasoning"
+                if selected_reasoning_effort:
+                    current_model_type = "Reasoning (reasoning_effort)"
+                elif prompt_mode_value:
+                    current_model_type = "Reasoning (prompt_mode)"
+                elif model_reasoning_type == "adjustable":
+                    current_model_type = "Reasoning (adjustable, default)"
+                elif model_reasoning_type == "native" or model_is_reasoning:
+                    current_model_type = "Reasoning (native)"
+                else:
+                    current_model_type = "Non Reasoning"
+                if current_model_type != "Non Reasoning":
+                    chat_kwargs["max_tokens"] = _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS
 
                 if not start_logged:
-                    _safe_log_info(INFO_MISTRAL_FINAL_SELECTION_START, model)
+                    _safe_log_info(INFO_MISTRAL_FINAL_SELECTION_START, _format_model_spec(model, selected_reasoning_effort))
                     start_logged = True
 
                 try:
@@ -598,8 +1197,10 @@ async def choose_genius_candidate_with_mistral(
                 except asyncio.TimeoutError:
                     _safe_log_error(ERROR_MISTRAL_TIMEOUT, model, MISTRAL_TIMEOUT_SECONDS)
                     resp = None
-                except (aiohttp.ClientError, OSError) as e:
-                    msg = str(e) or "mistral request failed"
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    msg = _format_mistral_error_message(e)
                     _log_mistral_exception(msg, model)
                     resp = None
 
@@ -621,6 +1222,8 @@ async def choose_genius_candidate_with_mistral(
                             model=model,
                             usage=usage_data,
                             model_type=current_model_type,
+                            reasoning_effort=selected_reasoning_effort,
+                            prompt_mode=prompt_mode_value,
                         )
                         return None, True
                     if err:
@@ -633,6 +1236,8 @@ async def choose_genius_candidate_with_mistral(
                             model=model,
                             usage=usage_data,
                             model_type=current_model_type,
+                            reasoning_effort=selected_reasoning_effort,
+                            prompt_mode=prompt_mode_value,
                         )
                         return idx_int, False
 
@@ -648,7 +1253,7 @@ async def choose_genius_candidate_with_mistral(
             task = asyncio.create_task(_run_selection())
             _MISTRAL_CHOICE_INFLIGHT[cache_key] = task
             try:
-                result = await task
+                result = await _await_mistral_selection_task(task)
             except asyncio.CancelledError:
                 try:
                     task.cancel()
@@ -666,10 +1271,18 @@ async def choose_genius_candidate_with_mistral(
                 _mistral_choice_cache_set(cache_key, now, result[0], result[1])
             return result
         try:
-            return await task
+            return await _await_mistral_selection_task(task)
         except asyncio.CancelledError:
             raise
         except Exception:
             return None, False
 
-    return await _run_selection()
+    task = asyncio.create_task(_run_selection())
+    try:
+        return await _await_mistral_selection_task(task)
+    except asyncio.CancelledError:
+        try:
+            task.cancel()
+        except RuntimeError:
+            pass
+        raise

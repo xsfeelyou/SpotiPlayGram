@@ -87,7 +87,9 @@ from lyrics.mistral_ai import (
     write_mistral_model,
     read_mistral_model,
     ensure_selected_models_cached,
-    _split_model_ids,
+    _split_model_specs,
+    _format_model_spec,
+    is_model_reasoning_mode_valid,
 )
 from lyrics.mistral_models import fetch_mistral_models_ids
 from config import Settings
@@ -369,13 +371,6 @@ async def setup_bot_commands(bot, user):
                 Button.text(BTN_BACK, resize=True),
                 Button.text(INFO_MAIN_MENU, resize=True),
             ]]
-            current_model = read_mistral_model()
-            _models_list = _split_model_ids(current_model)
-            if not _models_list and st.mistral_model:
-                _models_list = [st.mistral_model]
-            primary_model = _models_list[0] if _models_list else st.mistral_model
-            fallback_models = _models_list[1:] if len(_models_list) > 1 else []
-
             chat = await event.get_input_chat()
             loading_msg = await bot.send_message(chat, INFO_MISTRAL_LOADING, buttons=menu_buttons)
 
@@ -383,6 +378,14 @@ async def setup_bot_commands(bot, user):
             models_text = details_text or ""
             if err:
                 models_text = ERROR_MISTRAL_FETCH_MODELS.format(err)
+            current_model = read_mistral_model()
+            _models_list = [_format_model_spec(model, mode) for model, mode in _split_model_specs(current_model)]
+            if not _models_list and st.mistral_model:
+                _models_list = [_format_model_spec(model, mode) for model, mode in _split_model_specs(st.mistral_model)]
+                if not _models_list:
+                    _models_list = [st.mistral_model]
+            primary_model = _models_list[0] if _models_list else st.mistral_model
+            fallback_models = _models_list[1:] if len(_models_list) > 1 else []
 
             if fallback_models:
                 fallback_text = ", ".join(f"<code>{html.escape(m)}</code>" for m in fallback_models)
@@ -791,7 +794,7 @@ async def setup_bot_commands(bot, user):
                 state.mistral_busy = True
                 state.mistral_refresh_enabled = False
                 try:
-                    pattern = r"^[A-Za-z0-9._-]+(?:[\s,]+[A-Za-z0-9._-]+)*$"
+                    pattern = r"^[A-Za-z0-9._-]+(?:=[A-Za-z0-9._-]+)?(?:[ ,]+[A-Za-z0-9._-]+(?:=[A-Za-z0-9._-]+)?)*$"
                     if not re.fullmatch(pattern, text):
                         await event.respond(ERROR_MISTRAL_MODEL_FORMAT, parse_mode="html", buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]])
                         return
@@ -801,30 +804,15 @@ async def setup_bot_commands(bot, user):
                         await event.respond(ERROR_MISTRAL_MODEL_FORMAT, parse_mode="html", buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]])
                         return
 
-                try:
-                    saving_msg = await event.respond(
-                        INFO_MISTRAL_SAVING,
-                        buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]]
-                    )
-                except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
-                    saving_msg = None
-
-                ids, _, err = await fetch_mistral_models_ids(st.mistral_api_key)
-                if err:
-                    await _edit_or_respond(
-                        saving_msg,
-                        event,
-                        ERROR_MISTRAL_FETCH_MODELS.format(err),
-                        buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]],
-                    )
-                    return
-                parts = _split_model_ids(text)
+                saving_msg = None
+                parts = _split_model_specs(text)
                 seen = set()
                 normalized = []
-                for p in parts:
-                    if p not in seen:
-                        seen.add(p)
-                        normalized.append(p)
+                for model_id, reasoning_mode in parts:
+                    spec = _format_model_spec(model_id, reasoning_mode)
+                    if spec not in seen:
+                        seen.add(spec)
+                        normalized.append(spec)
                 if not normalized:
                     await _edit_or_respond(
                         saving_msg,
@@ -834,9 +822,33 @@ async def setup_bot_commands(bot, user):
                     )
                     return
 
+                try:
+                    saving_msg = await event.respond(
+                        INFO_MISTRAL_SAVING,
+                        buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]]
+                    )
+                except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
+                    saving_msg = None
+
+                model_ids_to_cache = [model_id for model_id, _ in parts]
+                ids, _, err = await fetch_mistral_models_ids(
+                    st.mistral_api_key,
+                    include_details=False,
+                    model_ids_to_cache=model_ids_to_cache,
+                )
+                if err:
+                    await _edit_or_respond(
+                        saving_msg,
+                        event,
+                        ERROR_MISTRAL_FETCH_MODELS.format(err),
+                        buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]],
+                    )
+                    return
+
                 valid_ids = set(ids or [])
                 for p in normalized:
-                    if p not in valid_ids:
+                    model_id, reasoning_mode = _split_model_specs(p)[0]
+                    if model_id not in valid_ids or not is_model_reasoning_mode_valid(model_id, reasoning_mode):
                         await _edit_or_respond(
                             saving_msg,
                             event,

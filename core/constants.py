@@ -159,6 +159,7 @@ INFO_TRANSLATION_REPLACED = f"{LOG_FORMAT_GENIUS}Translation replaced with origi
 INFO_GENIUS_NO_RESULTS = f"{LOG_FORMAT_GENIUS}No suitable songs found"
 INFO_GENIUS_SCORING_CHOSEN = f"{LOG_FORMAT_GENIUS}Chosen URL: {{0}}"
 ERROR_GENIUS_HTTP = f"{LOG_FORMAT_GENIUS}Genius HTTP error: {{0}} — {{1}}"
+ERROR_GENIUS_TIMEOUT = f"{LOG_FORMAT_GENIUS}Request timeout: {{0}} sec"
 
 INFO_GENIUS_CANDIDATE_SUMMARY = f"{LOG_FORMAT_GENIUS}  #{{0:02d}} {{1}} | album: {{2}} | date: {{3}} | score: {{4}} | url: {{5}}"
 INFO_GENIUS_CANDIDATE_REASON = f"{LOG_FORMAT_GENIUS}       {{0}}"
@@ -175,13 +176,13 @@ INFO_MISTRAL_MODELS_NON_REASONING = "<i>Available Non-Reasoning models:</i>"
 INFO_MISTRAL_MODELS_REASONING = "<i>Available Reasoning models:</i>"
 INFO_MISTRAL_LOADING = "⏳ Fetching and validating model list…"
 INFO_MISTRAL_SAVING = "⏳ Saving and validating selected models…"
-INFO_MISTRAL_ENTER_MODEL = "Enter model IDs separated by space or comma in priority order (copy from the list above).\nExample: <code>mistral-large-latest, magistral-medium-latest</code>"
+INFO_MISTRAL_ENTER_MODEL = "Enter model IDs separated by space or comma in priority order (copy from the list above).\nFor reasoning models you can add reasoning_effort as <code>model=effort</code>.\nIf <code>model=effort</code> is not specified, the model's default effort is used.\nExample: <code>mistral-large-latest, mistral-small-latest=high</code>"
 INFO_MISTRAL_MODEL_SAVED = "✅ Models updated to:\n{0}\n\nThe change will take effect on the next Spotify status update."
 INFO_MISTRAL_MODEL_UPDATED = f"{LOG_FORMAT_MISTRAL}Model updated: {{0}}"
 INFO_MISTRAL_MENU_DISABLED = "⚠️ Mistral menu is disabled (ENABLE_MISTRAL = False)"
 ERROR_MISTRAL_FETCH_MODELS = "⚠️ Failed to fetch model list: {0}"
 ERROR_MISTRAL_MODEL_INVALID = "⚠️ Invalid model. Please choose one from the list above"
-ERROR_MISTRAL_MODEL_FORMAT = "⚠️ Invalid input format. Enter model IDs separated by space or comma.\nExample: <code>mistral-large-latest, magistral-medium-latest</code>"
+ERROR_MISTRAL_MODEL_FORMAT = "⚠️ Invalid input format. Enter model IDs separated by space or comma.\nFor reasoning models use <code>model=effort</code>.\nIf <code>model=effort</code> is not specified, the model's default effort is used.\nExample: <code>mistral-large-latest, mistral-small-latest=high</code>"
 
 INFO_MISTRAL_SWITCH_MODEL = f"{LOG_FORMAT_MISTRAL}Trying model: {{0}}"
 ERROR_MISTRAL_SDK_MISSING = f"{LOG_FORMAT_MISTRAL}The 'mistralai' library is not installed"
@@ -193,6 +194,7 @@ ERROR_MISTRAL_MODEL_NOT_FOUND = f"{LOG_FORMAT_MISTRAL}Model is unavailable or no
 ERROR_MISTRAL_REQUEST = f"{LOG_FORMAT_MISTRAL}Request error: {{0}}"
 MISTRAL_TIMEOUT_SECONDS = 30
 
+GENIUS_TIMEOUT_SECONDS = 30
 GENIUS_SEARCH_CONCURRENCY = 100
 SEARCH_VARIANTS_LIMIT = 100
 GENIUS_SEARCH_PER_PAGE = 10

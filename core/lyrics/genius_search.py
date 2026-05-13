@@ -13,6 +13,7 @@ from constants import (
     ERROR_GENIUS_ACCESS_TOKEN_INVALID,
     ERROR_GENIUS_DETAILS_FAILED,
     ERROR_GENIUS_HTTP,
+    ERROR_GENIUS_TIMEOUT,
     ERROR_MISTRAL_FINAL_SELECTION,
     GENIUS_ALBUM_MIN_TRACKS,
     GENIUS_DETAILS_TOP_N,
@@ -47,6 +48,7 @@ from constants import (
     GENIUS_SLUG_TOKEN_MIN_LEN,
     GENIUS_TAG_FUZZY_CHARS_PERCENT,
     GENIUS_TAG_FUZZY_TOKENS_PERCENT,
+    GENIUS_TIMEOUT_SECONDS,
     GENIUS_TOP1_BONUS_MAX,
     GENIUS_TOP1_BONUS_PER,
     INFO_GENIUS_CANDIDATE_REASON,
@@ -120,11 +122,11 @@ async def _read_json_payload(resp) -> Optional[Dict[str, Any]]:
         _safe_log_error(
             ERROR_GENIUS_HTTP,
             "JSON",
-            t[:200],
+            _format_genius_error_detail(t),
         )
         return None
     if not isinstance(data, dict):
-        _safe_log_error(ERROR_GENIUS_HTTP, "JSON", t[:200])
+        _safe_log_error(ERROR_GENIUS_HTTP, "JSON", _format_genius_error_detail(t))
         return None
     return data
 
@@ -132,6 +134,26 @@ def _collapse_ws(value: Any) -> str:
     if value is None:
         return ""
     return " ".join(str(value).split())
+
+def _format_genius_error_detail(value: Any, max_len: int = 160) -> str:
+    if isinstance(value, BaseException):
+        text = str(value).strip() or value.__class__.__name__
+    else:
+        text = "" if value is None else str(value)
+    text = text.strip()
+    if not text:
+        return REASON_EMPTY_JSON_RESPONSE
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+    if title_match:
+        text = title_match.group(1)
+    else:
+        text = re.sub(r"<[^>]+>", " ", text)
+    text = _collapse_ws(text)
+    if not text:
+        text = "non-json response"
+    if len(text) > max_len:
+        text = text[:max_len - 3].rstrip() + "..."
+    return text
 
 def _log_no_results() -> None:
     if _is_mistral_enabled() and not _is_genius_detailed_log():
@@ -832,7 +854,7 @@ async def _api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Option
 
     for attempt in range(1, max_attempts + 1):
         try:
-            async with session.get(url, headers=headers, params=params, timeout=30) as resp:
+            async with session.get(url, headers=headers, params=params, timeout=GENIUS_TIMEOUT_SECONDS) as resp:
                 status = resp.status
                 if 200 <= status < 300:
                     return await _read_json_payload(resp)
@@ -859,7 +881,7 @@ async def _api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Option
                 _safe_log_error(
                     ERROR_GENIUS_HTTP,
                     status,
-                    txt[:200],
+                    _format_genius_error_detail(txt),
                 )
                 return None
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
@@ -868,7 +890,7 @@ async def _api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Option
                 delay_s = min(max(float(delay_s), 0.5), 30.0)
                 await asyncio.sleep(delay_s)
                 continue
-            _safe_log_error(ERROR_GENIUS_HTTP, "EXC", e)
+            _safe_log_error(ERROR_GENIUS_HTTP, "EXC", _format_genius_error_detail(e))
             return None
 
 async def _search_query(q: str) -> List[Dict[str, Any]]:
@@ -1537,6 +1559,27 @@ async def search_lyrics_url(track_name: str,
                             spotify_album_name: Optional[str] = None,
                             spotify_album_total_tracks: Optional[int] = None,
                             spotify_release_date: Optional[str] = None) -> Optional[str]:
+    timeout_seconds = max(1.0, _safe_float(GENIUS_TIMEOUT_SECONDS, 30.0))
+    try:
+        return await asyncio.wait_for(
+            _search_lyrics_url_impl(
+                track_name,
+                spotify_artists=spotify_artists,
+                spotify_album_name=spotify_album_name,
+                spotify_album_total_tracks=spotify_album_total_tracks,
+                spotify_release_date=spotify_release_date,
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        _safe_log_error(ERROR_GENIUS_TIMEOUT, GENIUS_TIMEOUT_SECONDS)
+        return None
+
+async def _search_lyrics_url_impl(track_name: str,
+                                  spotify_artists: Optional[List[Dict[str, Any]]] = None,
+                                  spotify_album_name: Optional[str] = None,
+                                  spotify_album_total_tracks: Optional[int] = None,
+                                  spotify_release_date: Optional[str] = None) -> Optional[str]:
     st = get_settings()
     token = st.genius_access_token
     if not token:

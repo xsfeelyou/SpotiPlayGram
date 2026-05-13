@@ -245,6 +245,7 @@ async def _check_genius_and_mistral(settings: Settings) -> bool:
         else:
             _safe_log_info(INFO_AUTH_GENIUS)
             genius_ok = False
+            genius_error_logged = False
             session = init_session()
             headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
             timeout = ClientTimeout(total=6.0)
@@ -262,11 +263,13 @@ async def _check_genius_and_mistral(settings: Settings) -> bool:
                         _ = await r.text()
                         if r.status in (401, 403):
                             _safe_log_error(ERROR_GENIUS_ACCESS_TOKEN_INVALID)
+                            genius_error_logged = True
                             break
                         if (r.status == 429 or 500 <= r.status < 600) and attempt < max_attempts:
                             await _sleep_auth_retry(LOG_FORMAT_GENIUS, delay_base, attempt, max_attempts)
                             continue
                         _safe_log_error(ERROR_AUTH_GENIUS)
+                        genius_error_logged = True
                         break
                 except (ClientError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
                     _safe_log_error(ERROR_AUTH_GENIUS, logger=dev_logger, exc_info=True)
@@ -277,6 +280,8 @@ async def _check_genius_and_mistral(settings: Settings) -> bool:
 
             if genius_ok:
                 _safe_log_info(INFO_AUTH_GENIUS_SUCCESS)
+            elif not genius_error_logged:
+                _safe_log_error(ERROR_AUTH_GENIUS)
 
     if not settings.enable_mistral:
         _safe_log_info(INFO_MISTRAL_DISABLED)

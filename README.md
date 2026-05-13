@@ -192,13 +192,13 @@ To run on another device (PC, server, VPS, etc.) after the initial authorization
 2. Create an API key
 3. Copy the key to `.env`
 
-**Registration Note:** Mistral registration may require a phone number for verification. At the time of writing, Mistral provides a free tier (up to ~1B tokens/month), which is more than enough for SpotiPlayGram (even if you listen to music 24/7, usage is usually far below ~2M tokens/month).
+**Registration Note:** Mistral registration may require a phone number for verification.
 
 **Accuracy Note:** Without Mistral AI, the selection of lyrics links from Genius will be less accurate. The built-in algorithm via the Genius API works well for most cases, but combined with Mistral AI, it significantly improves accuracy.
 
-**Caching Note:** Mistral AI uses a 1-hour result cache for performance optimization and token consumption reduction. Repeated requests for the same track will be processed instantly without additional API calls.
+**Caching Note:** Mistral AI uses a 1-hour result cache for performance optimization. Repeated requests for the same track will be processed instantly without additional API calls.
 
-**Model Selection Note:** You can compare Mistral model benchmarks at [Artificial Analysis](https://artificialanalysis.ai/providers/mistral) to choose a more accurate model for selecting the best lyrics URL from Genius search results. However, keep in mind that the smartest and heaviest models may start returning **HTTP 429** errors over time (`Service tier capacity exceeded for this model`) due to free tier rate limits — if this happens, switch to a lighter model.
+**Model Selection Note:** You can compare Mistral model benchmarks at [Artificial Analysis](https://artificialanalysis.ai/providers/mistral) to choose a more accurate model for selecting the best lyrics URL from Genius search results. Before choosing a model, check how many tokens per month are available for that model. Monthly token limits for each model are available at [Mistral AI Limits](https://admin.mistral.ai/plateforme/limits). With normal music listening, SpotiPlayGram usually uses up to 2 million tokens per month. In the maximum scenario, if you listen to music continuously 24/7 for a whole month and all tracks are no longer than 1 minute, usage will be about 50 million tokens per month. You can check actual token usage at [Mistral AI Usage](https://admin.mistral.ai/organization/usage?workspace_dialog_use_org_currency=false). However, keep in mind that the smartest and heaviest models may start returning **HTTP 429** errors over time due to free tier rate limits — if this happens, switch to a lighter model.
 
 ---
 
