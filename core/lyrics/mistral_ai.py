@@ -616,18 +616,6 @@ def _log_mistral_exception(message: str, model: str) -> None:
         _safe_log_error(ERROR_MISTRAL_REQUEST, message)
     _safe_log_error(ERROR_MISTRAL_FINAL_SELECTION, message)
 
-async def _await_mistral_selection_task(task: asyncio.Task) -> Tuple[Optional[int], bool]:
-    try:
-        return await asyncio.wait_for(task, timeout=float(MISTRAL_TIMEOUT_SECONDS))
-    except asyncio.TimeoutError:
-        try:
-            task.cancel()
-        except RuntimeError:
-            pass
-        await asyncio.gather(task, return_exceptions=True)
-        _safe_log_error(ERROR_MISTRAL_TIMEOUT, "selection", MISTRAL_TIMEOUT_SECONDS)
-        return None, False
-
 def _get_cached_model_info(model_id: str) -> Optional[Dict[str, Any]]:
     cache = _read_models_cache()
     models = cache.get("available_models", {})
@@ -1060,7 +1048,7 @@ async def choose_genius_candidate_with_mistral(
         inflight = _MISTRAL_CHOICE_INFLIGHT.get(cache_key)
         if inflight is not None:
             try:
-                return await _await_mistral_selection_task(inflight)
+                return await inflight
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1253,7 +1241,7 @@ async def choose_genius_candidate_with_mistral(
             task = asyncio.create_task(_run_selection())
             _MISTRAL_CHOICE_INFLIGHT[cache_key] = task
             try:
-                result = await _await_mistral_selection_task(task)
+                result = await task
             except asyncio.CancelledError:
                 try:
                     task.cancel()
@@ -1271,7 +1259,7 @@ async def choose_genius_candidate_with_mistral(
                 _mistral_choice_cache_set(cache_key, now, result[0], result[1])
             return result
         try:
-            return await _await_mistral_selection_task(task)
+            return await task
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1279,7 +1267,7 @@ async def choose_genius_candidate_with_mistral(
 
     task = asyncio.create_task(_run_selection())
     try:
-        return await _await_mistral_selection_task(task)
+        return await task
     except asyncio.CancelledError:
         try:
             task.cancel()

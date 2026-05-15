@@ -852,9 +852,11 @@ async def _api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Option
                 return float(base_delay) * float(attempt_num)
         return float(max(1, attempt_num))
 
+    timeout_seconds = max(1.0, _safe_float(GENIUS_TIMEOUT_SECONDS, 30.0))
+
     for attempt in range(1, max_attempts + 1):
         try:
-            async with session.get(url, headers=headers, params=params, timeout=GENIUS_TIMEOUT_SECONDS) as resp:
+            async with session.get(url, headers=headers, params=params, timeout=timeout_seconds) as resp:
                 status = resp.status
                 if 200 <= status < 300:
                     return await _read_json_payload(resp)
@@ -884,7 +886,15 @@ async def _api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Option
                     _format_genius_error_detail(txt),
                 )
                 return None
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        except asyncio.TimeoutError:
+            if attempt < max_attempts:
+                delay_s = _calc_backoff_seconds(attempt)
+                delay_s = min(max(float(delay_s), 0.5), 30.0)
+                await asyncio.sleep(delay_s)
+                continue
+            _safe_log_error(ERROR_GENIUS_TIMEOUT, timeout_seconds)
+            return None
+        except (aiohttp.ClientError, OSError) as e:
             if attempt < max_attempts:
                 delay_s = _calc_backoff_seconds(attempt)
                 delay_s = min(max(float(delay_s), 0.5), 30.0)
@@ -1559,27 +1569,6 @@ async def search_lyrics_url(track_name: str,
                             spotify_album_name: Optional[str] = None,
                             spotify_album_total_tracks: Optional[int] = None,
                             spotify_release_date: Optional[str] = None) -> Optional[str]:
-    timeout_seconds = max(1.0, _safe_float(GENIUS_TIMEOUT_SECONDS, 30.0))
-    try:
-        return await asyncio.wait_for(
-            _search_lyrics_url_impl(
-                track_name,
-                spotify_artists=spotify_artists,
-                spotify_album_name=spotify_album_name,
-                spotify_album_total_tracks=spotify_album_total_tracks,
-                spotify_release_date=spotify_release_date,
-            ),
-            timeout=timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        _safe_log_error(ERROR_GENIUS_TIMEOUT, GENIUS_TIMEOUT_SECONDS)
-        return None
-
-async def _search_lyrics_url_impl(track_name: str,
-                                  spotify_artists: Optional[List[Dict[str, Any]]] = None,
-                                  spotify_album_name: Optional[str] = None,
-                                  spotify_album_total_tracks: Optional[int] = None,
-                                  spotify_release_date: Optional[str] = None) -> Optional[str]:
     st = get_settings()
     token = st.genius_access_token
     if not token:
