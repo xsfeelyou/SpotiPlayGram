@@ -4,10 +4,15 @@ import json
 import os
 import importlib
 from typing import Optional, Iterable, Any
+try:
+    from anyascii import anyascii as _anyascii_impl
+except ImportError:
+    _anyascii_impl = None
+
 from .symbols import (
     _CHAR_EQUIV_MAP,
-    PRIMARY_SEPARATORS,
-    SECONDARY_SEPARATORS,
+    PRIMARY_SEPARATORS as _SYMBOLS_PRIMARY_SEPARATORS,
+    SECONDARY_SEPARATORS as _SYMBOLS_SECONDARY_SEPARATORS,
     SYMBOL_LETTER_EQUIV,
     APOSTROPHE_CHARS,
 )
@@ -28,22 +33,22 @@ _PENDING_TAG_RELOAD: bool = False
 
 _APOSTROPHE_TRANSLATION = {ord(ch): "'" for ch in APOSTROPHE_CHARS if ch != "'"}
 
-PRIMARY_SEPARATORS = list(dict.fromkeys(PRIMARY_SEPARATORS + APOSTROPHE_CHARS))
-SECONDARY_SEPARATORS = list(dict.fromkeys(SECONDARY_SEPARATORS + APOSTROPHE_CHARS))
+PRIMARY_SEPARATORS = list(dict.fromkeys(_SYMBOLS_PRIMARY_SEPARATORS + APOSTROPHE_CHARS))
+SECONDARY_SEPARATORS = list(dict.fromkeys(_SYMBOLS_SECONDARY_SEPARATORS + APOSTROPHE_CHARS))
 
 _PRIMARY_SET = set(PRIMARY_SEPARATORS)
 _SECONDARY_SET = set(SECONDARY_SEPARATORS)
 _ALL_SEP_SET = _PRIMARY_SET | _SECONDARY_SET
 
-_SEP_CLASS = "".join([re.escape(ch) for ch in SECONDARY_SEPARATORS])
-
-_FEAT_MARKERS_CACHE: set[str] | None = None
-_FEAT_MARKERS_MULTI_CACHE: list[list[str]] | None = None
-_FEAT_MARKERS_VERSION: int | None = None
+_SEP_CLASS = "".join(re.escape(ch) for ch in SECONDARY_SEPARATORS)
 
 _RE_PUNCT_WS_LEFT = re.compile(rf"(?<=\s)[{_SEP_CLASS}]+")
 _RE_PUNCT_WS_RIGHT = re.compile(rf"[{_SEP_CLASS}]+(?=\s)")
 _RE_SEP_TO_SPACE = re.compile(rf"(?:\s|[{_SEP_CLASS}]|[\\/])+")
+
+_FEAT_MARKERS_CACHE: set[str] | None = None
+_FEAT_MARKERS_MULTI_CACHE: list[list[str]] | None = None
+_FEAT_MARKERS_VERSION: int | None = None
 
 _ROMAN_BASE_CHARS = "IVXLCDM"
 _RE_ROMAN_L_I_SEGMENT = re.compile(
@@ -465,6 +470,34 @@ def apply_symbol_letter_equiv(text: Optional[str]) -> Optional[str]:
     s = str(text)
     return "".join(SYMBOL_LETTER_EQUIV.get(ch, ch) for ch in s)
 
+def apply_anyascii_translit(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    s = str(text)
+    if not s:
+        return s
+    if _anyascii_impl is None:
+        return s
+    try:
+        replaced = _anyascii_impl(s)
+    except (TypeError, ValueError):
+        return s
+    return replaced if replaced else s
+
+def generate_anyascii_variants(text: Optional[str]) -> list[str]:
+    if text is None:
+        return []
+    s = str(text)
+    if not s:
+        return []
+    replaced = apply_anyascii_translit(s) or ""
+    if not replaced:
+        return [s]
+    out: list[str] = [s]
+    if replaced != s:
+        out.append(replaced)
+    return out
+
 def generate_roman_l_i_variants(text: Optional[str]) -> list[str]:
     if text is None:
         return []
@@ -639,6 +672,54 @@ def _is_feat_placeholder_inner(inner: Optional[str]) -> bool:
 def feat_placeholder_pattern(text: Optional[str]) -> Optional[str]:
     tokens = _normalize_marker_tokens(text)
     return _feat_pattern_in_tokens_match(tokens)
+
+def split_artist_text_by_feat_markers(text: Optional[str]) -> list[str]:
+    if text is None:
+        return []
+    s = _normalize_item(normalize_apostrophes(str(text)))
+    if not s:
+        return []
+    raw_tokens = s.split()
+    if len(raw_tokens) < 3:
+        return [s]
+
+    norm_tokens = [normalize_letters(tok).lower() for tok in raw_tokens]
+    single, multi = _get_feat_markers_norm()
+    spans: list[tuple[int, int]] = []
+    i = 0
+    n = len(norm_tokens)
+    while i < n:
+        best_len = 0
+        for pat in multi:
+            m = len(pat)
+            if m <= 0 or i + m > n:
+                continue
+            if norm_tokens[i:i + m] == pat and m > best_len:
+                best_len = m
+        if best_len > 0:
+            spans.append((i, i + best_len))
+            i += best_len
+            continue
+        if norm_tokens[i] in single:
+            spans.append((i, i + 1))
+        i += 1
+
+    if not spans:
+        return [s]
+
+    parts: list[str] = []
+    start = 0
+    for left, right in spans:
+        part = _normalize_item(" ".join(raw_tokens[start:left]))
+        if part:
+            parts.append(part)
+        start = right
+    tail = _normalize_item(" ".join(raw_tokens[start:]))
+    if tail:
+        parts.append(tail)
+    if len(parts) < 2:
+        return [s]
+    return parts
 
 def strip_feat_placeholders_bracketed(text: str) -> str:
     if not text:

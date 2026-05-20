@@ -660,16 +660,6 @@ def is_model_reasoning_mode_valid(model_id: str, reasoning_mode: Optional[str]) 
     modes = get_model_reasoning_modes(model_id)
     return mode in modes
 
-async def _check_mistral_chat_payload(
-    session: aiohttp.ClientSession,
-    headers: Dict[str, str],
-    payload: Dict[str, Any],
-    timeout: aiohttp.ClientTimeout,
-    max_retries: int,
-) -> bool:
-    ok, _, _ = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
-    return ok
-
 async def _probe_mistral_chat_payload(
     session: aiohttp.ClientSession,
     headers: Dict[str, str],
@@ -1082,6 +1072,9 @@ async def choose_genius_candidate_with_mistral(
         "   - version_tag\n"
         "   Treat strings as visually similar if, after lowercasing and removing punctuation/spaces, "
         "they mostly look the same, even with small typos, doubled/missing letters or minor spelling variants.\n"
+        "   Also treat cross-script transliterations as strong matches: if one side is written in a non-Latin script "
+        "and the other side is an ASCII/Latin transliteration of the same text, consider them equivalent even when the "
+        "spelling is not identical letter-by-letter. This includes artist/title/version text and ASCII/Latin slug forms in URLs.\n"
         "2) If spotify_track_meta.featured_artists is non-empty, treat overlap between these names and "
         "candidate.featured_artists as a VERY STRONG signal. When several candidates share the same primary_artist "
         "and base title, you MUST prefer the candidate whose featured_artists visually match the Spotify "
@@ -1099,6 +1092,7 @@ async def choose_genius_candidate_with_mistral(
         "It is enough that, to a human reader, these fields clearly refer to the same song.\n"
         "5) When you are unsure / candidates seem similarly good, use the candidate url as an additional supporting signal:\n"
         "   - If candidate.url visually contains the same primary_artist, featured_artists (if any), title, and version_tag (if any), "
+        "including transliterated ASCII/Latin slug forms of the Spotify text, "
         "treat this as a strong confirmation.\n"
         "6) Use album and release_date ONLY as LAST-RESORT supporting signals (they are often missing or inconsistent between Spotify and Genius).\n"
         "   - An exact release_date match can be a mild confirmation, but it is NOT decisive by itself.\n"

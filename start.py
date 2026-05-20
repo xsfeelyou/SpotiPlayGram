@@ -2,6 +2,7 @@
 import subprocess
 import sys
 import time
+import importlib.util
 from typing import Iterable, Optional
 
 from core.logger import _safe_log_error, _safe_log_info
@@ -108,10 +109,9 @@ def setup_and_run(config: Optional[StartConfig] = None) -> None:
     run_main_script(python_executable, entry_script)
 
 def check_dependencies():
-    try:
-        import venv
+    if importlib.util.find_spec("venv") is not None:
         return True
-    except ImportError:
+    else:
         _safe_log_error(ERROR_VENV_MODULE_MISSING)
         return False
 

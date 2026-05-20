@@ -253,7 +253,7 @@ async def _apply_default_state(
                 release_date=None,
                 artist_urls=None,
                 track_url=None,
-                album_url=None
+                album_url=None,
             )
         except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
             pass
@@ -274,34 +274,9 @@ async def _apply_default_state(
         release_date=None,
         artist_urls=None,
         track_url=None,
-        album_url=None
+        album_url=None,
     )
     await update_channel_info(bot_client, DEFAULT_MESSAGE, False)
-
-async def _apply_default_state_and_delete(
-    *,
-    bot_client,
-    user_client,
-    channel_id,
-    write_track_info,
-    update_messages,
-    update_channel_info,
-    suppress_errors: bool,
-) -> None:
-    await _apply_default_state(
-        bot_client=bot_client,
-        write_track_info=write_track_info,
-        update_messages=update_messages,
-        update_channel_info=update_channel_info,
-        suppress_errors=suppress_errors,
-    )
-    if suppress_errors:
-        try:
-            await delete_all_messages(user_client, channel_id)
-        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
-            pass
-        return
-    await delete_all_messages(user_client, channel_id)
 
 async def setup_bot_commands(bot, user):
     st = get_settings()
@@ -658,15 +633,17 @@ async def setup_bot_commands(bot, user):
                             pass
 
                         try:
-                            await _apply_default_state_and_delete(
+                            await _apply_default_state(
                                 bot_client=bot,
-                                user_client=user,
-                                channel_id=st.tg_channel_id,
                                 write_track_info=write_track_info,
                                 update_messages=update_messages,
                                 update_channel_info=update_channel_info,
                                 suppress_errors=True,
                             )
+                            try:
+                                await delete_all_messages(user, st.tg_channel_id)
+                            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
+                                pass
                         except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError):
                             pass
 

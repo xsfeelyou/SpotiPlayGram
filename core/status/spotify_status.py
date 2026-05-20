@@ -55,6 +55,7 @@ from logger import _safe_log_info, _safe_log_error
 from utils.telethon_utils import safe_call_telethon
 from utils.http_session import init_session
 from lyrics.genius_search import search_lyrics_url
+from lyrics.patterns.base import split_artist_text_by_feat_markers
 from config import Settings
 from utils.spotify_client import get_spg_cache_handler
 
@@ -196,7 +197,21 @@ def _extract_spotify_track_meta(current_track_raw: Optional[dict]) -> tuple[Opti
     item = current_track_raw.get("item")
     if not isinstance(item, dict):
         return None, None, None
-    spotify_artists = item.get("artists") or None
+    spotify_artists_raw = item.get("artists") or None
+    spotify_artists: Optional[list[dict]] = None
+    if isinstance(spotify_artists_raw, list):
+        spotify_artists = []
+        for artist in spotify_artists_raw:
+            if not isinstance(artist, dict):
+                continue
+            split_names = split_artist_text_by_feat_markers(artist.get("name"))
+            if len(split_names) < 2:
+                spotify_artists.append(artist)
+                continue
+            for name in split_names:
+                clean_name = str(name).strip()
+                if clean_name:
+                    spotify_artists.append({"name": clean_name})
     album_total_tracks = _album_total_tracks_from_item(item)
     album_obj = item.get("album") if isinstance(item.get("album"), dict) else {}
     spotify_release_date_iso = _release_date_base(

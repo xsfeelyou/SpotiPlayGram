@@ -83,10 +83,12 @@ from .patterns.base import (
     _SECONDARY_SET,
     _is_feat_placeholder_inner,
     apply_symbol_letter_equiv,
+    generate_anyascii_variants,
     generate_roman_l_i_variants,
     generate_symbol_letter_equiv_variants,
     get_tag_patterns,
     get_tag_patterns_version,
+    split_artist_text_by_feat_markers,
 )
 
 API_BASE = "https://api.genius.com"
@@ -174,6 +176,17 @@ def _norm(s: Optional[str]) -> str:
     t = normalize_apostrophes(t)
     t = t.replace("'", "")
     return _collapse_ws(t).lower()
+
+def _spotify_text_variants(value: Optional[str]) -> List[str]:
+    out: List[str] = []
+    for item in generate_anyascii_variants(value):
+        cleaned = _safe_stripped(item)
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+    raw = _safe_stripped(value)
+    if raw and raw not in out:
+        out.insert(0, raw)
+    return out
 
 def _clear_title(s: str) -> str:
     t = _safe_stripped(s)
@@ -355,10 +368,18 @@ def _fuzzy_tag_match_in_text(tag_text: Optional[str], text: Optional[str], token
 def _consec_title_tokens_score(spotify_title: Optional[str], genius_title: str, genius_title_with_featured: str) -> Tuple[int, List[str]]:
     score = 0
     reasons: List[str] = []
-    stoks = _normalize_ws_tokens(spotify_title, strip_separators=True)
     gtoks = _normalize_ws_tokens(genius_title, strip_separators=True)
     gftoks = _normalize_ws_tokens(genius_title_with_featured, strip_separators=True)
-    k = max(_longest_common_consecutive_len(stoks, gtoks), _longest_common_consecutive_len(stoks, gftoks))
+    k = 0
+    for spotify_title_variant in _spotify_text_variants(spotify_title):
+        stoks = _normalize_ws_tokens(spotify_title_variant, strip_separators=True)
+        if not stoks:
+            continue
+        k = max(
+            k,
+            _longest_common_consecutive_len(stoks, gtoks),
+            _longest_common_consecutive_len(stoks, gftoks),
+        )
     if k > 0:
         add = min(GENIUS_SCORE_CONSEC_TOKENS_MAX, k * GENIUS_SCORE_CONSEC_TOKENS_PER)
         score += add
@@ -444,6 +465,14 @@ def _tokens_with_charseqs(s: Optional[str]) -> List[str]:
         if repl and repl != tok:
             sym_extra.append(repl)
     for e in sym_extra:
+        if e not in tokens:
+            tokens.append(e)
+    anyascii_extra: List[str] = []
+    for tok in tokens:
+        for repl in generate_anyascii_variants(tok):
+            if repl and repl != tok:
+                anyascii_extra.append(repl)
+    for e in anyascii_extra:
         if e not in tokens:
             tokens.append(e)
     tokens_sorted = sorted(set(tokens), key=lambda x: len(x), reverse=True)
@@ -702,8 +731,6 @@ def _relationship_tag_hint_score(tag: Optional[str], relationships: List[Dict[st
     return score, reasons
 
 def _calc_title_featured_mismatch_penalty(spotify_track_name: Optional[str], title_with_featured: str, featured_pref: Optional[List[str]], genius_song: Dict[str, Any]) -> Tuple[int, List[str]]:
-    penalty = 0
-    reasons: List[str] = []
     def _tokset(s: Optional[str]) -> Set[str]:
         n = _normalize_base_text(s)
         if not n:
@@ -717,48 +744,70 @@ def _calc_title_featured_mismatch_penalty(spotify_track_name: Optional[str], tit
             return ""
         return strip_feat_placeholders_bracketed(t)
 
-    tag_from_track, base_track = _extract_trailing_tag(spotify_track_name or "")
-    base_tokens = _tokset(base_track)
-    tag_tokens = _tokset(tag_from_track)
-    baseline = base_tokens | tag_tokens
-    gtokens = _tokset(_strip_feat_from_title_for_penalty(title_with_featured or ""))
-    extra = sorted([t for t in gtokens if t not in baseline])
-    missing_base = sorted([t for t in base_tokens if t not in gtokens])
-    missing_tag = sorted([t for t in tag_tokens if t not in gtokens])
-    join_sep = ", "
-    if extra:
-        sub = min(GENIUS_PENALTY_TOKEN_CAP, len(extra) * GENIUS_PENALTY_TITLE_EXTRA_TOKEN_PER)
-        penalty -= sub
-        reasons.append(f"title_extra_tokens -{sub} ({len(extra)} tokens: {join_sep.join(extra)})")
-    if missing_base:
-        sub = min(GENIUS_PENALTY_TOKEN_CAP, len(missing_base) * GENIUS_PENALTY_TITLE_MISSING_TOKEN_PER)
-        penalty -= sub
-        reasons.append(f"title_missing_tokens -{sub} ({len(missing_base)} tokens: {join_sep.join(missing_base)})")
-    if missing_tag:
-        sub = min(GENIUS_PENALTY_TOKEN_CAP, len(missing_tag) * GENIUS_PENALTY_TAG_MISSING_TOKEN_PER)
-        penalty -= sub
-        reasons.append(f"tag_missing_tokens_title -{sub} ({len(missing_tag)} tokens: {join_sep.join(missing_tag)})")
-
-    sp_feat_tokens: Set[str] = set()
-    for p in (featured_pref or []):
-        sp_feat_tokens |= _tokset(p)
-    gfeat_names = _extract_featured_from_genius(genius_song)
-    g_feat_tokens: Set[str] = set()
-    for n in gfeat_names:
-        g_feat_tokens |= _tokset(n)
-
-    if sp_feat_tokens or g_feat_tokens:
-        f_extra = sorted([t for t in g_feat_tokens if t not in sp_feat_tokens])
-        f_missing = sorted([t for t in sp_feat_tokens if t not in g_feat_tokens])
-        if f_extra:
-            sub = min(GENIUS_PENALTY_TOKEN_CAP, len(f_extra) * GENIUS_PENALTY_FEATURED_EXTRA_TOKEN_PER)
+    def _calc_penalty(track_value: Optional[str], featured_values: Optional[List[str]]) -> Tuple[int, List[str]]:
+        penalty = 0
+        reasons: List[str] = []
+        tag_from_track, base_track = _extract_trailing_tag(track_value or "")
+        base_tokens = _tokset(base_track)
+        tag_tokens = _tokset(tag_from_track)
+        baseline = base_tokens | tag_tokens
+        gtokens = _tokset(_strip_feat_from_title_for_penalty(title_with_featured or ""))
+        extra = sorted([t for t in gtokens if t not in baseline])
+        missing_base = sorted([t for t in base_tokens if t not in gtokens])
+        missing_tag = sorted([t for t in tag_tokens if t not in gtokens])
+        join_sep = ", "
+        if extra:
+            sub = min(GENIUS_PENALTY_TOKEN_CAP, len(extra) * GENIUS_PENALTY_TITLE_EXTRA_TOKEN_PER)
             penalty -= sub
-            reasons.append(f"featured_extra_tokens -{sub} ({len(f_extra)} tokens: {join_sep.join(f_extra)})")
-        if f_missing:
-            sub = min(GENIUS_PENALTY_TOKEN_CAP, len(f_missing) * GENIUS_PENALTY_FEATURED_MISSING_TOKEN_PER)
+            reasons.append(f"title_extra_tokens -{sub} ({len(extra)} tokens: {join_sep.join(extra)})")
+        if missing_base:
+            sub = min(GENIUS_PENALTY_TOKEN_CAP, len(missing_base) * GENIUS_PENALTY_TITLE_MISSING_TOKEN_PER)
             penalty -= sub
-            reasons.append(f"featured_missing_tokens -{sub} ({len(f_missing)} tokens: {join_sep.join(f_missing)})")
-    return penalty, reasons
+            reasons.append(f"title_missing_tokens -{sub} ({len(missing_base)} tokens: {join_sep.join(missing_base)})")
+        if missing_tag:
+            sub = min(GENIUS_PENALTY_TOKEN_CAP, len(missing_tag) * GENIUS_PENALTY_TAG_MISSING_TOKEN_PER)
+            penalty -= sub
+            reasons.append(f"tag_missing_tokens_title -{sub} ({len(missing_tag)} tokens: {join_sep.join(missing_tag)})")
+
+        sp_feat_tokens: Set[str] = set()
+        for p in (featured_values or []):
+            sp_feat_tokens |= _tokset(p)
+        gfeat_names = _extract_featured_from_genius(genius_song)
+        g_feat_tokens: Set[str] = set()
+        for n in gfeat_names:
+            g_feat_tokens |= _tokset(n)
+
+        if sp_feat_tokens or g_feat_tokens:
+            f_extra = sorted([t for t in g_feat_tokens if t not in sp_feat_tokens])
+            f_missing = sorted([t for t in sp_feat_tokens if t not in g_feat_tokens])
+            if f_extra:
+                sub = min(GENIUS_PENALTY_TOKEN_CAP, len(f_extra) * GENIUS_PENALTY_FEATURED_EXTRA_TOKEN_PER)
+                penalty -= sub
+                reasons.append(f"featured_extra_tokens -{sub} ({len(f_extra)} tokens: {join_sep.join(f_extra)})")
+            if f_missing:
+                sub = min(GENIUS_PENALTY_TOKEN_CAP, len(f_missing) * GENIUS_PENALTY_FEATURED_MISSING_TOKEN_PER)
+                penalty -= sub
+                reasons.append(f"featured_missing_tokens -{sub} ({len(f_missing)} tokens: {join_sep.join(f_missing)})")
+        return penalty, reasons
+
+    featured_pref_raw = [_safe_stripped(p) for p in (featured_pref or []) if _safe_stripped(p)]
+    featured_pref_anyascii = [
+        variants[-1]
+        for p in featured_pref_raw
+        for variants in [_spotify_text_variants(p)]
+        if variants
+    ]
+    best_penalty = 0
+    best_reasons: List[str] = []
+    for track_value, featured_values in [
+        (_safe_stripped(spotify_track_name), featured_pref_raw),
+        ((_spotify_text_variants(spotify_track_name) or [""])[-1], featured_pref_anyascii),
+    ]:
+        current_penalty, current_reasons = _calc_penalty(track_value, featured_values)
+        if current_penalty > best_penalty or not best_reasons:
+            best_penalty = current_penalty
+            best_reasons = current_reasons
+    return best_penalty, best_reasons
 
 def _slug_token_match_score(
     song: Dict[str, Any],
@@ -1110,16 +1159,30 @@ def _score_song_detailed(song: Dict[str, Any], variants: List[Dict[str, Optional
             reasons_all.append(f"top1_bonus +{add_top} ({k} hits)")
     return score, reasons_all
 
-def _score_song(song: Dict[str, Any], variants: List[Dict[str, Optional[str]]], *, featured_pref: Optional[List[str]] = None, top1_counts: Optional[Dict[int, int]] = None, spotify_track_name: Optional[str] = None, spotify_album_name: Optional[str] = None, spotify_album_total_tracks: Optional[int] = None) -> int:
-    sc, _ = _score_song_detailed(song, variants, featured_pref=featured_pref, top1_counts=top1_counts, spotify_track_name=spotify_track_name, spotify_album_name=spotify_album_name, spotify_album_total_tracks=spotify_album_total_tracks)
-    return sc
-
 def _extract_artist_names_from_spotify(artists: Optional[List[Dict[str, Any]]]) -> List[str]:
     if not artists:
         return []
-    names = [str(a.get("name") or "").strip() for a in artists if isinstance(a, dict)]
-    names = [normalize_apostrophes(n) for n in names]
-    return [_collapse_ws(n) for n in names if n]
+    names: List[str] = []
+    seen: Set[str] = set()
+    for artist in artists:
+        if not isinstance(artist, dict):
+            continue
+        raw_name = str(artist.get("name") or "").strip()
+        if not raw_name:
+            continue
+        split_names = split_artist_text_by_feat_markers(raw_name)
+        if not split_names:
+            split_names = [raw_name]
+        for name in split_names:
+            clean_name = _collapse_ws(normalize_apostrophes(name))
+            if not clean_name:
+                continue
+            key = _norm(clean_name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            names.append(clean_name)
+    return names
 
 def _build_artist_combinations(names: List[str]) -> List[Tuple[str, Optional[str]]]:
     out: List[Tuple[str, Optional[str]]] = []
@@ -1491,6 +1554,143 @@ def _expand_variants_with_roman_l_i(variants: List[Dict[str, Optional[str]]]) ->
             _append_variant(pa, fea, tr_alt, tg)
     return out
 
+def _expand_variants_with_normalized_letters(variants: List[Dict[str, Optional[str]]]) -> List[Dict[str, Optional[str]]]:
+    out: List[Dict[str, Optional[str]]] = []
+    seen: Set[Tuple[str, str, str, str, bool]] = set()
+
+    def _append_variant(source: Dict[str, Any], pa: Optional[str], fea: Optional[str], tr: Optional[str], tg: Optional[str]) -> None:
+        skip_track_tag_feat_extract = bool(source.get("_skip_track_tag_feat_extract"))
+        key = (
+            str(pa or "").lower(),
+            str(fea or "").lower(),
+            str(tr or "").lower(),
+            str(tg or "").lower(),
+            skip_track_tag_feat_extract,
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        item = dict(source)
+        item["primary_artist"] = pa
+        item["featured_artists"] = fea if fea else None
+        item["track"] = tr
+        item["tag"] = tg if tg else None
+        if not skip_track_tag_feat_extract and "_skip_track_tag_feat_extract" in item:
+            item.pop("_skip_track_tag_feat_extract", None)
+        out.append(item)
+
+    def _field_variants(value: Optional[str]) -> List[Optional[str]]:
+        if value is None:
+            return [None]
+        original = str(value)
+        normalized = normalize_letters(original)
+        if not normalized or normalized == original:
+            return [value]
+        return [value, normalized]
+
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        pa = v.get("primary_artist")
+        fea = v.get("featured_artists")
+        tr = v.get("track")
+        tg = v.get("tag")
+        alt_fields: List[Tuple[str, Optional[str], Optional[str]]] = []
+        for name, value in (
+            ("primary_artist", pa),
+            ("featured_artists", fea),
+            ("track", tr),
+            ("tag", tg),
+        ):
+            value_variants = _field_variants(value)
+            original = value_variants[0] if value_variants else value
+            alternative = next((item for item in value_variants if item != original), original)
+            if alternative != original:
+                alt_fields.append((name, original, alternative))
+
+        combo_count = 1 << len(alt_fields)
+        for mask in sorted(range(combo_count), key=lambda current: (current.bit_count(), current)):
+            values: Dict[str, Optional[str]] = {
+                "primary_artist": pa,
+                "featured_artists": fea,
+                "track": tr,
+                "tag": tg,
+            }
+            for idx, (name, original, alternative) in enumerate(alt_fields):
+                values[name] = alternative if ((mask >> idx) & 1) else original
+            _append_variant(v, values["primary_artist"], values["featured_artists"], values["track"], values["tag"])
+    return out
+
+def _expand_variants_with_anyascii(variants: List[Dict[str, Optional[str]]]) -> List[Dict[str, Optional[str]]]:
+    out: List[Dict[str, Optional[str]]] = []
+    seen: Set[Tuple[str, str, str, str, bool]] = set()
+
+    def _append_variant(source: Dict[str, Any], pa: Optional[str], fea: Optional[str], tr: Optional[str], tg: Optional[str]) -> None:
+        skip_track_tag_feat_extract = bool(source.get("_skip_track_tag_feat_extract"))
+        key = (
+            str(pa or "").lower(),
+            str(fea or "").lower(),
+            str(tr or "").lower(),
+            str(tg or "").lower(),
+            skip_track_tag_feat_extract,
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        item = dict(source)
+        item["primary_artist"] = pa
+        item["featured_artists"] = fea if fea else None
+        item["track"] = tr
+        item["tag"] = tg if tg else None
+        if not skip_track_tag_feat_extract and "_skip_track_tag_feat_extract" in item:
+            item.pop("_skip_track_tag_feat_extract", None)
+        out.append(item)
+
+    def _field_variants(value: Optional[str]) -> List[Optional[str]]:
+        if value is None:
+            return [None]
+        generated = generate_anyascii_variants(value)
+        if not generated:
+            return [value]
+        result: List[Optional[str]] = []
+        for item in generated:
+            if item not in result:
+                result.append(item)
+        return result or [value]
+
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        pa = v.get("primary_artist")
+        fea = v.get("featured_artists")
+        tr = v.get("track")
+        tg = v.get("tag")
+        alt_fields: List[Tuple[str, Optional[str], Optional[str]]] = []
+        for name, value in (
+            ("primary_artist", pa),
+            ("featured_artists", fea),
+            ("track", tr),
+            ("tag", tg),
+        ):
+            value_variants = _field_variants(value)
+            original = value_variants[0] if value_variants else value
+            alternative = next((item for item in value_variants if item != original), original)
+            if alternative != original:
+                alt_fields.append((name, original, alternative))
+
+        combo_count = 1 << len(alt_fields)
+        for mask in sorted(range(combo_count), key=lambda current: (current.bit_count(), current)):
+            values: Dict[str, Optional[str]] = {
+                "primary_artist": pa,
+                "featured_artists": fea,
+                "track": tr,
+                "tag": tg,
+            }
+            for idx, (name, original, alternative) in enumerate(alt_fields):
+                values[name] = alternative if ((mask >> idx) & 1) else original
+            _append_variant(v, values["primary_artist"], values["featured_artists"], values["track"], values["tag"])
+    return out
+
 def _meta_str(val: Optional[str]) -> str:
     s = _safe_stripped(val)
     return s if s else ""
@@ -1649,7 +1849,11 @@ async def search_lyrics_url(track_name: str,
     variants = _ensure_tag_tokenization(variants, original_track=track_name)
     variants = _expand_variants_with_roman_l_i(variants)
     variants = variants[:SEARCH_VARIANTS_LIMIT]
+    variants_normalized = _expand_variants_with_normalized_letters(variants)
+    variants_for_match = _expand_variants_with_anyascii(variants_normalized)
     base_queries: List[str] = []
+    extra_normalized_queries: List[str] = []
+    extra_anyascii_queries: List[str] = []
     extra_symbol_queries: List[str] = []
     extra_mode_queries: List[str] = []
     seen_q: Set[str] = set()
@@ -1731,7 +1935,7 @@ async def search_lyrics_url(track_name: str,
                 else:
                     matched = any(
                         _song_matches_variant_fuzzy(song, v, GENIUS_FUZZY_TOKENS_PERCENT, GENIUS_FUZZY_CHARS_PERCENT)
-                        for v in variants
+                        for v in variants_for_match
                     )
                     if matched:
                         matched_song_ids.add(sid)
@@ -1749,33 +1953,61 @@ async def search_lyrics_url(track_name: str,
 
     await _run_search_phase(base_queries)
     if not base_songs and remaining_slots > 0:
-        for q in list(base_queries):
-            if len(extra_symbol_queries) >= remaining_slots:
+        for v in variants_normalized:
+            if len(extra_normalized_queries) >= remaining_slots:
                 break
-            q_vars = generate_symbol_letter_equiv_variants(q)
-            for q_sym in q_vars:
-                _append_query(q_sym, extra_symbol_queries, remaining_slots)
-                if len(extra_symbol_queries) >= remaining_slots:
+            q2 = _build_query_from_variant(v)
+            _append_query(q2, extra_normalized_queries, remaining_slots)
+        if extra_normalized_queries:
+            await _run_search_phase(extra_normalized_queries)
+    if not base_songs and remaining_slots > 0:
+        remaining_for_anyascii = max(0, remaining_slots - len(extra_normalized_queries))
+        if remaining_for_anyascii > 0:
+            for v in variants_for_match:
+                if len(extra_anyascii_queries) >= remaining_for_anyascii:
                     break
+                q2 = _build_query_from_variant(v)
+                _append_query(q2, extra_anyascii_queries, remaining_for_anyascii)
+        if extra_anyascii_queries:
+            await _run_search_phase(extra_anyascii_queries)
+    if not base_songs and remaining_slots > 0:
+        remaining_for_symbol = max(0, remaining_slots - len(extra_normalized_queries) - len(extra_anyascii_queries))
+        if remaining_for_symbol > 0:
+            for q in list(base_queries):
+                if len(extra_symbol_queries) >= remaining_for_symbol:
+                    break
+                q_vars = generate_symbol_letter_equiv_variants(q)
+                for q_sym in q_vars:
+                    _append_query(q_sym, extra_symbol_queries, remaining_for_symbol)
+                    if len(extra_symbol_queries) >= remaining_for_symbol:
+                        break
         if extra_symbol_queries:
             await _run_search_phase(extra_symbol_queries)
     if not base_songs and remaining_slots > 0:
-        remaining_for_mode = max(0, remaining_slots - len(extra_symbol_queries))
+        remaining_for_mode = max(0, remaining_slots - len(extra_normalized_queries) - len(extra_anyascii_queries) - len(extra_symbol_queries))
         if remaining_for_mode > 0:
             artist_modes = ["norm", "concat", "spaced"]
             track_modes = ["norm", "concat", "spaced"]
-            for v in variants:
-                for q2 in _build_mode_queries(
-                    v,
-                    artist_modes,
-                    track_modes,
-                    found_initial_tag_or_feat_placeholders,
-                ):
-                    _append_query(q2, extra_mode_queries, remaining_for_mode)
-                    if len(extra_mode_queries) >= remaining_for_mode:
-                        break
+            mode_variants_groups: List[List[Dict[str, Optional[str]]]] = [
+                variants,
+                variants_normalized,
+                variants_for_match,
+            ]
+            for current_variants in mode_variants_groups:
                 if len(extra_mode_queries) >= remaining_for_mode:
                     break
+                for v in current_variants:
+                    for q2 in _build_mode_queries(
+                        v,
+                        artist_modes,
+                        track_modes,
+                        found_initial_tag_or_feat_placeholders,
+                    ):
+                        _append_query(q2, extra_mode_queries, remaining_for_mode)
+                        if len(extra_mode_queries) >= remaining_for_mode:
+                            break
+                    if len(extra_mode_queries) >= remaining_for_mode:
+                        break
 
             if extra_mode_queries:
                 await _run_search_phase(extra_mode_queries)
@@ -1811,9 +2043,9 @@ async def search_lyrics_url(track_name: str,
             best_song_fb2 = None
             best_score_fb2 = -10**9
             for s in pool:
-                sc = _score_song(
+                sc, _ = _score_song_detailed(
                     s,
-                    variants,
+                    variants_for_match,
                     featured_pref=featured_pref_list,
                     top1_counts=top1_counts,
                     spotify_track_name=track_name,
@@ -1834,7 +2066,7 @@ async def search_lyrics_url(track_name: str,
     for s in candidates:
         sc, reasons = _score_song_detailed(
             s,
-            variants,
+            variants_for_match,
             featured_pref=featured_pref_list,
             top1_counts=top1_counts,
             spotify_track_name=track_name,

@@ -12,6 +12,7 @@ def install_libs():
         ("spotipy", "spotipy"),
         ("telethon", "telethon"),
         ("mistralai", "mistralai"),
+        ("anyascii", "anyascii"),
     ]
     for pkg, inst in libs:
         try: __import__(pkg)
@@ -174,23 +175,6 @@ async def _start_telegram_client(
             except (ValueError, TypeError, OSError):
                 pass
             raise
-
-async def _start_telegram_user(settings: Settings) -> TelegramClient:
-    return await _start_telegram_client(
-        settings,
-        session_name="user",
-        start_log=INFO_AUTH_TG_USER,
-        success_log=INFO_AUTH_TG_USER_SUCCESS,
-    )
-
-async def _start_telegram_bot(settings: Settings) -> TelegramClient:
-    return await _start_telegram_client(
-        settings,
-        session_name="bot",
-        start_log=INFO_AUTH_TG_BOT,
-        success_log=INFO_AUTH_TG_BOT_SUCCESS,
-        bot_token=settings.tg_bot_token,
-    )
 
 async def _start_spotify(settings: Settings) -> AsyncSpotifyClient:
     _safe_log_info(INFO_AUTH_SPOTIFY)
@@ -425,8 +409,19 @@ async def main():
             pass
 
     try:
-        user = await _start_telegram_user(settings)
-        bot = await _start_telegram_bot(settings)
+        user = await _start_telegram_client(
+            settings,
+            session_name="user",
+            start_log=INFO_AUTH_TG_USER,
+            success_log=INFO_AUTH_TG_USER_SUCCESS,
+        )
+        bot = await _start_telegram_client(
+            settings,
+            session_name="bot",
+            start_log=INFO_AUTH_TG_BOT,
+            success_log=INFO_AUTH_TG_BOT_SUCCESS,
+            bot_token=settings.tg_bot_token,
+        )
         spotify = await _start_spotify(settings)
         mistral_valid = await _check_genius_and_mistral(settings)
         bot_module.set_mistral_api_key_valid(mistral_valid)
