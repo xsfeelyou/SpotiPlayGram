@@ -1,11 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import os
+import copy
 import json
 import asyncio
 import re
 import hashlib
 from collections import OrderedDict
-import aiohttp
 from typing import Optional, List, Dict, Any, Tuple, Literal, get_args, get_origin
 from constants import (
     DIRS,
@@ -22,16 +22,14 @@ from constants import (
     MISTRAL_TIMEOUT_SECONDS,
 )
 from logger import _safe_log_info, _safe_log_error
-from utils.http_session import init_session
+from utils.mistral_client import (
+    complete_mistral_chat,
+    get_mistral_client_class,
+    probe_mistral_chat_payload,
+)
 from config import Settings
 
-try:
-    from mistralai.client import Mistral as MistralClient
-except ImportError:
-    try:
-        from mistralai import Mistral as MistralClient
-    except ImportError:
-        MistralClient = None
+MistralClient = get_mistral_client_class()
 
 _MISTRAL_LOG_PATH = os.path.join(DIRS["LOGS"], "GENIUS_MISTRAL_FINAL_SELECTION.log")
 _MISTRAL_MODELS_CACHE_PATH = os.path.join(DIRS["SESSION"], "mistral", "mistral_models_list.json")
@@ -54,32 +52,17 @@ _MISTRAL_REASONING_PROBE_JSON_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
-__all__ = [
-    "get_mistral_models_chain",
-    "read_mistral_model",
-    "write_mistral_model",
-    "choose_genius_candidate_with_mistral",
-    "is_model_reasoning",
-    "get_model_reasoning_modes",
-    "is_model_reasoning_mode_valid",
-    "update_models_cache",
-    "check_model_reasoning_type",
-    "check_model_reasoning_capabilities",
-    "ensure_selected_models_cached",
-    "_format_model_spec",
-]
-
 _MISTRAL_CHOICE_CACHE_TTL_SECONDS: float = 3600.0
 _MISTRAL_CHOICE_CACHE_MAX_SIZE: int = int(_MISTRAL_CHOICE_CACHE_TTL_SECONDS)
 _MISTRAL_FINAL_SELECTION_MAX_TOKENS: int = 16
-_MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS: int = 32768
+_MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS: int = 1024
 _MISTRAL_MODELS_CACHE_SCHEMA_VERSION: int = 2
 _MISTRAL_MODEL_CAPABILITY_CONCURRENCY: int = 100
 _MISTRAL_CHOICE_CACHE: "OrderedDict[str, Tuple[float, Optional[int], bool]]" = OrderedDict()
 _MISTRAL_CHOICE_INFLIGHT: Dict[str, asyncio.Task] = {}
 
-def _mistral_choice_cache_now() -> float:
-    return asyncio.get_running_loop().time()
+_models_cache_mem: Optional[Dict[str, Any]] = None
+_models_cache_mem_mtime: Optional[float] = None
 
 def _mistral_choice_cache_purge(now: float) -> None:
     while _MISTRAL_CHOICE_CACHE:
@@ -108,7 +91,29 @@ def _mistral_choice_cache_set(key: str, now: float, idx: Optional[int], explicit
     while len(_MISTRAL_CHOICE_CACHE) > _MISTRAL_CHOICE_CACHE_MAX_SIZE:
         _MISTRAL_CHOICE_CACHE.popitem(last=False)
 
-def _build_mistral_choice_cache_key(
+MistralChoiceSource = Literal["fresh", "cache", "inflight", "skipped"]
+
+def build_mistral_payload_text(
+    spotify_track_meta: Dict[str, str],
+    genius_candidates_meta: List[Dict[str, Any]],
+) -> Optional[str]:
+    payload = {
+        "spotify_track_meta": spotify_track_meta,
+        "genius_candidates_meta": genius_candidates_meta,
+    }
+    try:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+def _format_mistral_payload_for_log(payload_json: str) -> str:
+    try:
+        parsed = json.loads(payload_json)
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return payload_json
+
+def build_mistral_choice_cache_key(
     chain: List[str],
     spotify_track_meta: Dict[str, str],
     genius_candidates_meta: List[Dict[str, Any]],
@@ -328,7 +333,7 @@ def _write_mistral_log(
     lines.append("SENT TO MISTRAL")
     lines.append("-" * 40)
     lines.append("")
-    lines.append(payload_json)
+    lines.append(_format_mistral_payload_for_log(payload_json))
     lines.append("")
     lines.append("-" * 40)
     lines.append("RECEIVED FROM MISTRAL")
@@ -410,16 +415,31 @@ def get_mistral_models_chain() -> List[str]:
     return chain
 
 def _read_models_cache() -> Dict[str, Any]:
+    global _models_cache_mem, _models_cache_mem_mtime
     try:
-        with open(_MISTRAL_MODELS_CACHE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        mtime = os.path.getmtime(_MISTRAL_MODELS_CACHE_PATH)
+    except OSError:
+        _models_cache_mem = None
+        _models_cache_mem_mtime = None
         return {}
-    return {}
+    if _models_cache_mem is None or _models_cache_mem_mtime != mtime:
+        try:
+            with open(_MISTRAL_MODELS_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            _models_cache_mem = None
+            _models_cache_mem_mtime = mtime
+            return {}
+        if not isinstance(data, dict):
+            _models_cache_mem = None
+            _models_cache_mem_mtime = mtime
+            return {}
+        _models_cache_mem = data
+        _models_cache_mem_mtime = mtime
+    return copy.deepcopy(_models_cache_mem)
 
 def _write_models_cache(data: Dict[str, Any]) -> None:
+    global _models_cache_mem, _models_cache_mem_mtime
     try:
         parent = os.path.dirname(_MISTRAL_MODELS_CACHE_PATH)
         if parent:
@@ -430,6 +450,12 @@ def _write_models_cache(data: Dict[str, Any]) -> None:
         os.replace(tmp_path, _MISTRAL_MODELS_CACHE_PATH)
     except OSError:
         return
+    try:
+        _models_cache_mem = copy.deepcopy(data) if isinstance(data, dict) else None
+        _models_cache_mem_mtime = os.path.getmtime(_MISTRAL_MODELS_CACHE_PATH)
+    except OSError:
+        _models_cache_mem = None
+        _models_cache_mem_mtime = None
 
 def _coerce_to_text(value: Any) -> str:
     if value is None:
@@ -661,38 +687,20 @@ def is_model_reasoning_mode_valid(model_id: str, reasoning_mode: Optional[str]) 
     return mode in modes
 
 async def _probe_mistral_chat_payload(
-    session: aiohttp.ClientSession,
     headers: Dict[str, str],
     payload: Dict[str, Any],
-    timeout: aiohttp.ClientTimeout,
+    timeout_seconds: Optional[float],
     max_retries: int,
 ) -> Tuple[bool, str, bool]:
-    url = "https://api.mistral.ai/v1/chat/completions"
-    for attempt in range(max_retries):
-        try:
-            async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
-                if resp.status == 200:
-                    try:
-                        data = await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
-                        data = await resp.text()
-                    return True, _extract_mistral_content_text(data), _mistral_response_has_thinking(data)
-                if resp.status in (400, 404, 422):
-                    return False, "", False
-                if resp.status == 429:
-                    await asyncio.sleep(1.0 * (attempt + 1))
-                    continue
-                if resp.status >= 500:
-                    await asyncio.sleep(0.5 * (attempt + 1))
-                    continue
-                return False, "", False
-        except asyncio.TimeoutError:
-            await asyncio.sleep(1.0 * (attempt + 1))
-            continue
-        except (aiohttp.ClientError, OSError):
-            await asyncio.sleep(0.5)
-            continue
-    return False, "", False
+    ok, data = await probe_mistral_chat_payload(
+        headers,
+        payload,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+    )
+    if not ok:
+        return False, "", False
+    return True, _extract_mistral_content_text(data), _mistral_response_has_thinking(data)
 
 def _is_probe_json_valid(out_text: str) -> bool:
     if not out_text:
@@ -712,8 +720,6 @@ async def check_model_reasoning_capabilities(
     timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "Content-Type": "application/json"}
-    session = init_session()
-    timeout = aiohttp.ClientTimeout(total=float(timeout_seconds if timeout_seconds is not None else MISTRAL_TIMEOUT_SECONDS))
     efforts: List[str] = []
     default_has_thinking = False
     effort_candidates: List[str] = []
@@ -744,7 +750,7 @@ async def check_model_reasoning_capabilities(
                 },
             },
         }
-        ok, out_text, _ = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
+        ok, out_text, _ = await _probe_mistral_chat_payload(headers, payload, timeout_seconds, max_retries)
         if ok and _is_probe_json_valid(out_text):
             efforts.append(effort)
     has_active_reasoning_effort = any(effort != "none" for effort in efforts)
@@ -765,7 +771,7 @@ async def check_model_reasoning_capabilities(
                 },
             },
         }
-        ok, out_text, has_thinking = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
+        ok, out_text, has_thinking = await _probe_mistral_chat_payload(headers, payload, timeout_seconds, max_retries)
         default_has_thinking = bool(ok and _is_probe_json_valid(out_text) and has_thinking)
     prompt_mode_reasoning = False
     if not has_active_reasoning_effort and not default_has_thinking and known_reasoning is not False:
@@ -786,7 +792,7 @@ async def check_model_reasoning_capabilities(
                 },
             },
         }
-        ok, out_text, _ = await _probe_mistral_chat_payload(session, headers, payload, timeout, max_retries)
+        ok, out_text, _ = await _probe_mistral_chat_payload(headers, payload, timeout_seconds, max_retries)
         prompt_mode_reasoning = bool(ok and _is_probe_json_valid(out_text))
     if default_has_thinking:
         reasoning_type = "native"
@@ -806,10 +812,6 @@ async def check_model_reasoning_capabilities(
         "default_has_thinking": default_has_thinking,
         "prompt_mode_reasoning": prompt_mode_reasoning,
     }
-
-async def check_model_reasoning_type(model_id: str, api_key: str, max_retries: int = 3) -> bool:
-    capabilities = await check_model_reasoning_capabilities(model_id, api_key, max_retries=max_retries)
-    return bool(capabilities.get("reasoning", False))
 
 async def update_models_cache(
     models_data: List[Dict[str, Any]],
@@ -1011,49 +1013,55 @@ async def ensure_selected_models_cached(api_key: str) -> None:
 async def choose_genius_candidate_with_mistral(
     spotify_track_meta: Dict[str, str],
     genius_candidates_meta: List[Dict[str, Any]],
-) -> Tuple[Optional[int], bool]:
+    *,
+    cache_key: Optional[str] = None,
+    payload_text: Optional[str] = None,
+) -> Tuple[Optional[int], bool, MistralChoiceSource]:
     if not genius_candidates_meta:
-        return None, False
+        return None, False, "skipped"
 
     st = get_settings()
     api_key = st.mistral_api_key
     if MistralClient is None:
         _safe_log_error(ERROR_MISTRAL_SDK_MISSING)
-        return None, False
+        return None, False, "skipped"
     if not api_key:
         _safe_log_error(ERROR_AUTH_MISTRAL_API_KEY_MISSING)
-        return None, False
+        return None, False, "skipped"
 
     chain = get_mistral_models_chain()
-    cache_key = _build_mistral_choice_cache_key(chain, spotify_track_meta, genius_candidates_meta)
+    if cache_key is None:
+        cache_key = build_mistral_choice_cache_key(chain, spotify_track_meta, genius_candidates_meta)
     if cache_key:
-        now = _mistral_choice_cache_now()
+        now = asyncio.get_running_loop().time()
         cached = _mistral_choice_cache_get(cache_key, now)
         if cached is not None:
             idx_cached, explicit_none_cached = cached
             if explicit_none_cached:
-                return None, True
-            return idx_cached, False
+                return None, True, "cache"
+            return idx_cached, False, "cache"
 
         inflight = _MISTRAL_CHOICE_INFLIGHT.get(cache_key)
         if inflight is not None:
             try:
-                return await inflight
+                idx_inflight, explicit_none_inflight = await inflight
+                return idx_inflight, explicit_none_inflight, "inflight"
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass
 
-    payload = {
-        "spotify_track_meta": spotify_track_meta,
-        "genius_candidates_meta": genius_candidates_meta,
-    }
+    if payload_text is None:
+        payload = {
+            "spotify_track_meta": spotify_track_meta,
+            "genius_candidates_meta": genius_candidates_meta,
+        }
 
-    try:
-        payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
-    except (TypeError, ValueError):
-        _safe_log_error(ERROR_MISTRAL_FINAL_SELECTION, "failed to serialize payload")
-        return None, False
+        try:
+            payload_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            _safe_log_error(ERROR_MISTRAL_FINAL_SELECTION, "failed to serialize payload")
+            return None, False, "skipped"
 
     sys_content = (
         "You are a strict selector of the best Genius lyrics URL for a Spotify track.\n"
@@ -1119,115 +1127,116 @@ async def choose_genius_candidate_with_mistral(
 
     async def _run_selection() -> Tuple[Optional[int], bool]:
         start_logged = False
-        async with MistralClient(api_key=api_key) as mc:
-            for idx_model, model_spec in enumerate(chain):
-                model, selected_reasoning_effort = _parse_model_spec_token(model_spec)
-                if not model:
-                    continue
-                messages = [
-                    {"role": "system", "content": sys_content},
-                    {"role": "user", "content": user_content},
-                ]
-                model_is_reasoning = is_model_reasoning(model)
-                model_reasoning_type = get_model_reasoning_type(model)
-                prompt_mode_value: Optional[str] = None
-                model_reasoning_modes = get_model_reasoning_modes(model)
-                if selected_reasoning_effort and selected_reasoning_effort not in model_reasoning_modes:
-                    selected_reasoning_effort = None
-                chat_kwargs: Dict[str, Any] = {
-                    "model": model,
-                    "messages": messages,
-                    "stream": False,
-                    "max_tokens": _MISTRAL_FINAL_SELECTION_MAX_TOKENS,
-                    "temperature": 0,
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "genius_final_choice",
-                            "schema": _MISTRAL_FINAL_SELECTION_JSON_SCHEMA,
-                        },
+        for idx_model, model_spec in enumerate(chain):
+            model, selected_reasoning_effort = _parse_model_spec_token(model_spec)
+            if not model:
+                continue
+            messages = [
+                {"role": "system", "content": sys_content},
+                {"role": "user", "content": user_content},
+            ]
+            model_is_reasoning = is_model_reasoning(model)
+            model_reasoning_type = get_model_reasoning_type(model)
+            prompt_mode_value: Optional[str] = None
+            model_reasoning_modes = get_model_reasoning_modes(model)
+            if selected_reasoning_effort and selected_reasoning_effort not in model_reasoning_modes:
+                selected_reasoning_effort = None
+            chat_kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "max_tokens": _MISTRAL_FINAL_SELECTION_MAX_TOKENS,
+                "temperature": 0,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "genius_final_choice",
+                        "schema": _MISTRAL_FINAL_SELECTION_JSON_SCHEMA,
                     },
-                }
-                if selected_reasoning_effort:
-                    chat_kwargs["reasoning_effort"] = selected_reasoning_effort
-                elif model_reasoning_type == "prompt_mode":
-                    prompt_mode_value = "reasoning"
-                if prompt_mode_value:
-                    chat_kwargs["prompt_mode"] = "reasoning"
-                if selected_reasoning_effort:
-                    current_model_type = "Reasoning (reasoning_effort)"
-                elif prompt_mode_value:
-                    current_model_type = "Reasoning (prompt_mode)"
-                elif model_reasoning_type == "adjustable":
-                    current_model_type = "Reasoning (adjustable, default)"
-                elif model_reasoning_type == "native" or model_is_reasoning:
-                    current_model_type = "Reasoning (native)"
-                else:
-                    current_model_type = "Non Reasoning"
-                if current_model_type != "Non Reasoning":
-                    chat_kwargs["max_tokens"] = _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS
+                },
+            }
+            if selected_reasoning_effort:
+                chat_kwargs["reasoning_effort"] = selected_reasoning_effort
+            elif model_reasoning_type == "prompt_mode":
+                prompt_mode_value = "reasoning"
+            if prompt_mode_value:
+                chat_kwargs["prompt_mode"] = "reasoning"
+            if selected_reasoning_effort:
+                current_model_type = "Reasoning (reasoning_effort)"
+            elif prompt_mode_value:
+                current_model_type = "Reasoning (prompt_mode)"
+            elif model_reasoning_type == "adjustable":
+                current_model_type = "Reasoning (adjustable, default)"
+            elif model_reasoning_type == "native" or model_is_reasoning:
+                current_model_type = "Reasoning (native)"
+            else:
+                current_model_type = "Non Reasoning"
+            if current_model_type != "Non Reasoning":
+                chat_kwargs["max_tokens"] = _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS
 
-                if not start_logged:
-                    _safe_log_info(INFO_MISTRAL_FINAL_SELECTION_START, _format_model_spec(model, selected_reasoning_effort))
-                    start_logged = True
+            if not start_logged:
+                _safe_log_info(INFO_MISTRAL_FINAL_SELECTION_START, _format_model_spec(model, selected_reasoning_effort))
+                start_logged = True
 
-                try:
-                    resp = await asyncio.wait_for(
-                        mc.chat.complete_async(**chat_kwargs),
-                        timeout=MISTRAL_TIMEOUT_SECONDS,
+            try:
+                resp = await complete_mistral_chat(
+                    api_key,
+                    chat_kwargs,
+                    MISTRAL_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _safe_log_error(ERROR_MISTRAL_TIMEOUT, model, MISTRAL_TIMEOUT_SECONDS)
+                resp = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                msg = _format_mistral_error_message(e)
+                _log_mistral_exception(msg, model)
+                resp = None
+
+            if resp is not None:
+                out_text = _extract_mistral_content_text(resp)
+                usage = getattr(resp, "usage", None)
+                usage_data: Optional[Dict[str, int]] = None
+                if usage:
+                    usage_data = {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                        "completion_tokens": getattr(usage, "completion_tokens", 0),
+                        "total_tokens": getattr(usage, "total_tokens", 0),
+                    }
+                idx_int, explicit_none, err = _parse_mistral_idx(out_text)
+                if explicit_none:
+                    _write_mistral_log(
+                        payload_json=payload_text,
+                        response_text=out_text,
+                        model=model,
+                        usage=usage_data,
+                        model_type=current_model_type,
+                        reasoning_effort=selected_reasoning_effort,
+                        prompt_mode=prompt_mode_value,
                     )
-                except asyncio.TimeoutError:
-                    _safe_log_error(ERROR_MISTRAL_TIMEOUT, model, MISTRAL_TIMEOUT_SECONDS)
-                    resp = None
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    msg = _format_mistral_error_message(e)
-                    _log_mistral_exception(msg, model)
-                    resp = None
+                    return None, True
+                if err:
+                    _safe_log_error(ERROR_MISTRAL_REQUEST, err)
+                    _safe_log_error(ERROR_MISTRAL_FINAL_SELECTION, err)
+                else:
+                    _write_mistral_log(
+                        payload_json=payload_text,
+                        response_text=out_text,
+                        model=model,
+                        usage=usage_data,
+                        model_type=current_model_type,
+                        reasoning_effort=selected_reasoning_effort,
+                        prompt_mode=prompt_mode_value,
+                    )
+                    return idx_int, False
 
-                if resp is not None:
-                    out_text = _extract_mistral_content_text(resp)
-                    usage = getattr(resp, "usage", None)
-                    usage_data: Optional[Dict[str, int]] = None
-                    if usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
-                            "completion_tokens": getattr(usage, "completion_tokens", 0),
-                            "total_tokens": getattr(usage, "total_tokens", 0),
-                        }
-                    idx_int, explicit_none, err = _parse_mistral_idx(out_text)
-                    if explicit_none:
-                        _write_mistral_log(
-                            payload_json=payload_text,
-                            response_text=out_text,
-                            model=model,
-                            usage=usage_data,
-                            model_type=current_model_type,
-                            reasoning_effort=selected_reasoning_effort,
-                            prompt_mode=prompt_mode_value,
-                        )
-                        return None, True
-                    if err:
-                        _safe_log_error(ERROR_MISTRAL_REQUEST, err)
-                        _safe_log_error(ERROR_MISTRAL_FINAL_SELECTION, err)
-                    else:
-                        _write_mistral_log(
-                            payload_json=payload_text,
-                            response_text=out_text,
-                            model=model,
-                            usage=usage_data,
-                            model_type=current_model_type,
-                            reasoning_effort=selected_reasoning_effort,
-                            prompt_mode=prompt_mode_value,
-                        )
-                        return idx_int, False
-
-                if idx_model + 1 < len(chain):
-                    if _is_genius_detailed_log():
-                        _safe_log_info(INFO_MISTRAL_SWITCH_MODEL, chain[idx_model + 1])
-                    continue
-                return None, False
+            if idx_model + 1 < len(chain):
+                if _is_genius_detailed_log():
+                    _safe_log_info(INFO_MISTRAL_SWITCH_MODEL, chain[idx_model + 1])
+                continue
+            return None, False
+        return None, False
 
     if cache_key:
         task = _MISTRAL_CHOICE_INFLIGHT.get(cache_key)
@@ -1249,19 +1258,21 @@ async def choose_genius_candidate_with_mistral(
                     _MISTRAL_CHOICE_INFLIGHT.pop(cache_key, None)
 
             if result[1] or result[0] is not None:
-                now = _mistral_choice_cache_now()
+                now = asyncio.get_running_loop().time()
                 _mistral_choice_cache_set(cache_key, now, result[0], result[1])
-            return result
+            return result[0], result[1], "fresh"
         try:
-            return await task
+            idx_shared, explicit_none_shared = await task
+            return idx_shared, explicit_none_shared, "inflight"
         except asyncio.CancelledError:
             raise
         except Exception:
-            return None, False
+            return None, False, "skipped"
 
     task = asyncio.create_task(_run_selection())
     try:
-        return await task
+        idx_direct, explicit_none_direct = await task
+        return idx_direct, explicit_none_direct, "fresh"
     except asyncio.CancelledError:
         try:
             task.cancel()

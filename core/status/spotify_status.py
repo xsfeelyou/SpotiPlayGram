@@ -1,9 +1,10 @@
-﻿import os
+import os
 import asyncio
 import aiohttp
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional, Callable, Any, Set
 
 from telethon import functions, types
 from telethon.errors import RPCError
@@ -79,9 +80,36 @@ force_default_requested = False
 updates_suspended = False
 suspended_on_track_id = None
 suspended_since = None
+last_successful_cover_url = None
 
 _CACHE_HANDLER = None
 _NORMALIZE_FILES_FN: Optional[Callable] = None
+
+@dataclass
+class _ChannelCommitPayload:
+    track_title: str
+    is_playing: bool
+    cover_url: Optional[str]
+    track_id: Optional[str]
+    artist_names: Optional[str]
+    track_name: Optional[str]
+    album_name: Optional[str]
+    release_date: Optional[str]
+    artist_urls: Optional[list[str]]
+    track_url: Optional[str]
+    album_url: Optional[str]
+    current_track_raw: Optional[dict]
+    genius_url: Optional[str] = None
+    uploaded_photo: Any = None
+    cover_media_unchanged: bool = False
+    prepared_message_content: Optional[str] = None
+    prepared_entities: Optional[list] = None
+
+@dataclass
+class _CoverPreuploadResult:
+    uploaded_photo: Any
+    source: str
+    errors: tuple[str, ...] = ()
 
 def _get_cache_handler():
     global _CACHE_HANDLER
@@ -112,7 +140,7 @@ async def _download_bytes(session, url: str) -> bytes:
             raise RuntimeError("empty body")
         return data
 
-async def _preupload_cover_photo(bot_client, cover_url: str, channel: PeerChannel):
+async def _preupload_cover_photo_external(bot_client, cover_url: str, channel: PeerChannel) -> Optional[_CoverPreuploadResult]:
     try:
         input_photo = await asyncio.wait_for(
             safe_call_telethon(
@@ -122,48 +150,112 @@ async def _preupload_cover_photo(bot_client, cover_url: str, channel: PeerChanne
                     media=types.InputMediaPhotoExternal(url=cover_url),
                 ),
             ),
-            timeout=10.0,
+            timeout=5.0,
         )
         if input_photo and getattr(input_photo, "photo", None):
-            _safe_log_info(INFO_COVER_DOWNLOADED_PRIMARY)
-            return input_photo.photo
-    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
-        _safe_log_error(ERROR_COVER_UPLOAD, e)
+            return _CoverPreuploadResult(uploaded_photo=input_photo.photo, source="primary")
+    except asyncio.CancelledError:
+        raise
+    except (aiohttp.ClientError, RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
+        error_text = str(e).strip() or e.__class__.__name__
+        return _CoverPreuploadResult(uploaded_photo=None, source="primary", errors=(f"primary: {error_text}",))
+    return None
 
+async def _preupload_cover_photo_fallback(bot_client, cover_url: str) -> Optional[_CoverPreuploadResult]:
     session = init_session()
     cover_data: Optional[bytes] = None
+    error_messages: list[str] = []
     try:
-        cover_data = await asyncio.wait_for(_download_bytes(session, cover_url), timeout=10.0)
+        cover_data = await asyncio.wait_for(_download_bytes(session, cover_url), timeout=5.0)
+    except asyncio.CancelledError:
+        raise
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as e:
-        _safe_log_error(ERROR_COVER_UPLOAD, e)
+        error_text = str(e).strip() or e.__class__.__name__
+        error_messages.append(f"download: {error_text}")
 
     if cover_data is not None:
         try:
-            up_file = await bot_client.upload_file(cover_data, file_name="cover.jpg")
-            _safe_log_info(INFO_COVER_DOWNLOADED_FALLBACK1)
-            return up_file
+            up_file = await asyncio.wait_for(
+                bot_client.upload_file(cover_data, file_name="cover.jpg"),
+                timeout=5.0,
+            )
+            return _CoverPreuploadResult(uploaded_photo=up_file, source="fallback1")
+        except asyncio.CancelledError:
+            raise
         except (asyncio.TimeoutError, OSError, RPCError, ConnectionError) as e:
-            _safe_log_error(ERROR_COVER_UPLOAD, e)
+            error_text = str(e).strip() or e.__class__.__name__
+            error_messages.append(f"upload bytes: {error_text}")
 
     cover_path: Optional[str] = None
     try:
         if cover_data is None:
-            cover_data = await asyncio.wait_for(_download_bytes(session, cover_url), timeout=10.0)
+            cover_data = await asyncio.wait_for(_download_bytes(session, cover_url), timeout=5.0)
         with tempfile.NamedTemporaryFile("wb", suffix=".jpg", dir=DIRS["SESSION"], delete=False) as f:
             f.write(cover_data)
             cover_path = f.name
-        up_file = await bot_client.upload_file(cover_path)
-        _safe_log_info(INFO_COVER_DOWNLOADED_FALLBACK2)
-        return up_file
+        up_file = await asyncio.wait_for(
+            bot_client.upload_file(cover_path),
+            timeout=5.0,
+        )
+        return _CoverPreuploadResult(uploaded_photo=up_file, source="fallback2")
+    except asyncio.CancelledError:
+        raise
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError, RPCError, ConnectionError) as e:
-        _safe_log_error(ERROR_COVER_UPLOAD, e)
-        return None
+        error_text = str(e).strip() or e.__class__.__name__
+        error_messages.append(f"upload file: {error_text}")
+        return _CoverPreuploadResult(uploaded_photo=None, source="fallback", errors=tuple(dict.fromkeys(error_messages)))
     finally:
         try:
             if cover_path and os.path.exists(cover_path):
                 os.remove(cover_path)
         except OSError:
             pass
+
+async def _preupload_cover_photo(bot_client, cover_url: str, channel: PeerChannel):
+    external_task = asyncio.create_task(_preupload_cover_photo_external(bot_client, cover_url, channel))
+    fallback_task = asyncio.create_task(_preupload_cover_photo_fallback(bot_client, cover_url))
+    pending_tasks: Set[asyncio.Task] = {external_task, fallback_task}
+    error_messages: list[str] = []
+    try:
+        while pending_tasks:
+            done, pending = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+            pending_tasks = set(pending)
+            for done_task in done:
+                try:
+                    result = await done_task
+                except asyncio.CancelledError:
+                    for task in pending_tasks:
+                        task.cancel()
+                    await asyncio.gather(*pending_tasks, return_exceptions=True)
+                    raise
+                except BaseException as e:
+                    error_text = str(e).strip() or e.__class__.__name__
+                    error_messages.append(f"preupload task: {error_text}")
+                    continue
+                if not isinstance(result, _CoverPreuploadResult):
+                    continue
+                if result.uploaded_photo is None:
+                    if result.errors:
+                        error_messages.extend(result.errors)
+                    continue
+                if result.source == "primary":
+                    _safe_log_info(INFO_COVER_DOWNLOADED_PRIMARY)
+                elif result.source == "fallback1":
+                    _safe_log_info(INFO_COVER_DOWNLOADED_FALLBACK1)
+                elif result.source == "fallback2":
+                    _safe_log_info(INFO_COVER_DOWNLOADED_FALLBACK2)
+                for task in pending_tasks:
+                    task.cancel()
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+                return result.uploaded_photo
+        if error_messages:
+            _safe_log_error(ERROR_COVER_UPLOAD, "; ".join(dict.fromkeys(error_messages)))
+        return None
+    except asyncio.CancelledError:
+        for task in pending_tasks:
+            task.cancel()
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        raise
 
 def _normalize_track_info(data: Optional[dict]) -> dict:
     if not isinstance(data, dict):
@@ -220,6 +312,196 @@ def _extract_spotify_track_meta(current_track_raw: Optional[dict]) -> tuple[Opti
     )
     return spotify_artists, album_total_tracks, spotify_release_date_iso
 
+def _select_spotify_cover_url(images: Any) -> Optional[str]:
+    if not isinstance(images, list) or not images:
+        return None
+    candidates: list[tuple[int, int, int, str]] = []
+    for idx, image in enumerate(images):
+        if not isinstance(image, dict):
+            continue
+        url = image.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        width = image.get("width")
+        height = image.get("height")
+        w = width if isinstance(width, int) and width > 0 else 0
+        h = height if isinstance(height, int) and height > 0 else 0
+        area = w * h
+        candidates.append((area, idx, min(w, h), url))
+    if not candidates:
+        return None
+    suitable = [item for item in candidates if item[2] >= 2000]
+    if suitable:
+        return min(suitable, key=lambda item: (item[0], item[1]))[3]
+    return max(candidates, key=lambda item: (item[0], -item[1]))[3]
+
+async def _collect_channel_commit_payload(
+    bot_client,
+    *,
+    st: Settings,
+    track_title: str,
+    cover_url: Optional[str],
+    track_id: Optional[str],
+    is_playing: bool,
+    artist_names,
+    track_name,
+    album_name,
+    release_date,
+    artist_urls,
+    track_url,
+    album_url,
+    current_track_raw,
+    track_changed: bool,
+) -> _ChannelCommitPayload:
+    payload = _ChannelCommitPayload(
+        track_title=track_title,
+        is_playing=is_playing,
+        cover_url=cover_url,
+        track_id=track_id,
+        artist_names=artist_names,
+        track_name=track_name,
+        album_name=album_name,
+        release_date=release_date,
+        artist_urls=artist_urls,
+        track_url=track_url,
+        album_url=album_url,
+        current_track_raw=current_track_raw,
+    )
+
+    if not (is_playing and track_changed):
+        return payload
+
+    lyrics_task: Optional[asyncio.Task] = None
+    cover_task: Optional[asyncio.Task] = None
+    phase1_tasks: list[asyncio.Task] = []
+
+    if cover_url:
+        channel = PeerChannel(st.tg_channel_id)
+        if cover_url == last_successful_cover_url:
+            payload.cover_media_unchanged = True
+        else:
+            cover_task = asyncio.create_task(_preupload_cover_photo(bot_client, cover_url, channel))
+            phase1_tasks.append(cover_task)
+
+    if st.enable_genius and st.genius_access_token and track_id:
+        spotify_artists, album_total_tracks, spotify_release_date_iso = _extract_spotify_track_meta(current_track_raw)
+
+        async def _lyrics_task():
+            res = await search_lyrics_url(
+                track_name,
+                spotify_artists=spotify_artists,
+                spotify_album_name=album_name,
+                spotify_album_total_tracks=album_total_tracks,
+                spotify_release_date=spotify_release_date_iso,
+            )
+            if isinstance(res, str) and res:
+                return res
+            return None
+
+        lyrics_task = asyncio.create_task(_lyrics_task())
+        phase1_tasks.append(lyrics_task)
+
+    if phase1_tasks:
+        try:
+            phase1_results = await asyncio.gather(*phase1_tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in phase1_tasks:
+                try:
+                    if isinstance(task, asyncio.Task) and not task.done():
+                        task.cancel()
+                except RuntimeError:
+                    pass
+            await asyncio.gather(*phase1_tasks, return_exceptions=True)
+            raise
+
+        phase1_results_by_task = {
+            task: result
+            for task, result in zip(phase1_tasks, phase1_results)
+        }
+        if lyrics_task is not None:
+            lyrics_result = phase1_results_by_task.get(lyrics_task)
+            if isinstance(lyrics_result, str):
+                payload.genius_url = lyrics_result
+
+        if cover_task is not None:
+            cover_result = phase1_results_by_task.get(cover_task)
+            if isinstance(cover_result, (Photo, InputFile, InputFileBig)):
+                payload.uploaded_photo = cover_result
+
+    payload.prepared_message_content, payload.prepared_entities = _build_playing_message_payload(
+        artist_names,
+        track_name,
+        album_name,
+        release_date,
+        artist_urls,
+        track_url,
+        album_url,
+        current_track=current_track_raw,
+        genius_url=payload.genius_url,
+    )
+    return payload
+
+async def _commit_channel_commit_payload(bot_client, payload: _ChannelCommitPayload, *, track_changed: bool) -> bool:
+    global force_default_requested, last_successful_cover_url
+    if not track_changed:
+        return True
+
+    commit_operations: list[Any] = []
+    commit_ok = await update_messages(
+        bot_client=bot_client,
+        cover_url=payload.cover_url,
+        is_playing=payload.is_playing,
+        artist_names=payload.artist_names,
+        track_name=payload.track_name,
+        album_name=payload.album_name,
+        release_date=payload.release_date,
+        artist_urls=payload.artist_urls,
+        track_url=payload.track_url,
+        album_url=payload.album_url,
+        track_changed=track_changed,
+        current_track=payload.current_track_raw if payload.is_playing else None,
+        genius_url=payload.genius_url,
+        uploaded_photo=payload.uploaded_photo,
+        cover_media_unchanged=payload.cover_media_unchanged,
+        prepared_message_content=payload.prepared_message_content,
+        prepared_entities=payload.prepared_entities,
+        commit_operations=commit_operations,
+    )
+    commit_ok = bool(
+        commit_ok and await update_channel_info(
+            bot_client,
+            payload.track_title,
+            payload.is_playing,
+            uploaded_photo=payload.uploaded_photo,
+            skip_photo_update=payload.cover_media_unchanged,
+            commit_operations=commit_operations,
+        )
+    )
+
+    if commit_ok:
+        commit_results = await asyncio.gather(*commit_operations, return_exceptions=True)
+    else:
+        for op in commit_operations:
+            close_op = getattr(op, "close", None)
+            if callable(close_op):
+                close_op()
+        commit_results = []
+
+    for res in commit_results:
+        if isinstance(res, BaseException):
+            commit_ok = False
+        elif res is not True:
+            commit_ok = False
+
+    if not commit_ok:
+        force_default_requested = True
+        last_successful_cover_url = None
+    elif payload.is_playing and payload.cover_url and (payload.cover_media_unchanged or payload.uploaded_photo is not None):
+        last_successful_cover_url = payload.cover_url
+    elif not payload.is_playing:
+        last_successful_cover_url = None
+    return commit_ok and (not force_default_requested)
+
 def _is_spotify_track_playing_payload(payload: Optional[dict]) -> tuple[bool, Optional[dict]]:
     if not isinstance(payload, dict) or not payload or not payload.get("is_playing"):
         return False, None
@@ -270,15 +552,6 @@ async def get_current_track(spotify):
         return None
 
     is_track_playing, item = _is_spotify_track_playing_payload(current_track)
-    if (not is_track_playing) and was_playing:
-        retry_track = await spotify.current_playback()
-        if retry_track is None:
-            return None
-        retry_is_playing, retry_item = _is_spotify_track_playing_payload(retry_track)
-        if retry_is_playing:
-            current_track = retry_track
-            item = retry_item
-            is_track_playing = True
 
     if is_track_playing:
         track_id = item.get("id")
@@ -311,11 +584,7 @@ async def get_current_track(spotify):
                 except (ValueError, TypeError):
                     formatted_release_date = release_date
             cover_url = None
-            images = album.get("images") or []
-            if isinstance(images, list) and images:
-                first = images[0]
-                if isinstance(first, dict):
-                    cover_url = first.get("url")
+            cover_url = _select_spotify_cover_url(album.get("images"))
 
             if track_id != previous_track_id or not was_playing:
                 _safe_log_info(INFO_TRACK_PLAYING, artist_names, track_name)
@@ -360,25 +629,90 @@ def _split_artist_values(artist_names: Optional[str], artist_urls: Optional[list
         return [artist_names], urls_list[:1]
     return names_list, urls_list
 
+def _build_playing_message_payload(
+    artist_names,
+    track_name,
+    album_name,
+    release_date,
+    artist_urls,
+    track_url,
+    album_url,
+    current_track=None,
+    genius_url=None,
+):
+    track_name = track_name or ""
+    album_name = album_name or ""
+    release_date = release_date or ""
+    album_label = ALBUM_LABEL_ALBUM
+    item = current_track.get("item") if isinstance(current_track, dict) else None
+    if not (current_track and current_track.get("is_playing") and item and item.get("type") == "track"):
+        _safe_log_info(INFO_FALLBACK_TRACK_INFO)
+        artist_names_list, artist_urls_local = _split_artist_values(artist_names, artist_urls)
+    else:
+        artist_names_list = []
+        artist_urls_local = []
+        for a in (item.get("artists") or []):
+            if not isinstance(a, dict):
+                continue
+            name = a.get("name")
+            url = (a.get("external_urls") or {}).get("spotify")
+            if not name:
+                continue
+            artist_names_list.append(str(name))
+            artist_urls_local.append(str(url) if url else None)
+        total_tracks = _album_total_tracks_from_item(item)
+        if isinstance(total_tracks, int) and total_tracks > 0:
+            album_label = ALBUM_LABEL_SINGLE if total_tracks <= 4 else ALBUM_LABEL_ALBUM
+
+    if not artist_names_list:
+        artist_names_list, artist_urls_local = _split_artist_values(artist_names, artist_urls)
+
+    message_content = ", ".join(artist_names_list) + " – " + track_name + "\n\n" + \
+                    f"{album_label}{album_name}\n" + \
+                    f"{RELEASE_DATE_PREFIX}{release_date}"
+
+    if genius_url:
+        message_content += f"\n\n{LYRICS_ON_GENIUS}"
+    entities = []
+    current_offset = 0
+    for i, name in enumerate(artist_names_list):
+        append_entity(entities, MessageEntityBold, current_offset, len(name))
+        if i < len(artist_urls_local) and artist_urls_local[i]:
+            append_entity(entities, MessageEntityTextUrl, current_offset, len(name), url=artist_urls_local[i])
+        current_offset += len(name) + (2 if i < len(artist_names_list) - 1 else 0)
+    track_start = message_content.index(" – ") + len(" – ")
+    album_start = message_content.index(album_label) + len(album_label)
+    release_date_start = message_content.index(RELEASE_DATE_PREFIX) + len(RELEASE_DATE_PREFIX)
+    if track_name:
+        append_entity(entities, MessageEntityBold, track_start, len(track_name))
+        if track_url:
+            append_entity(entities, MessageEntityTextUrl, track_start, len(track_name), url=track_url)
+    if album_name and album_url:
+        append_entity(entities, MessageEntityTextUrl, album_start, len(album_name), url=album_url)
+    if release_date:
+        append_entity(entities, types.MessageEntityItalic, release_date_start, len(release_date))
+    if genius_url:
+        lyrics_start = message_content.rindex(LYRICS_ON_GENIUS)
+        append_entity(entities, MessageEntityTextUrl, lyrics_start, len(LYRICS_ON_GENIUS), url=genius_url)
+        append_entity(entities, MessageEntityUnderline, lyrics_start, len(LYRICS_ON_GENIUS))
+    return message_content, entities
+
 async def reset_to_default_state(bot_client, reason: str = ""):
-    global last_text_message_content, default_media_applied, force_default_requested, updates_suspended, suspended_since
+    global last_text_message_content, default_media_applied, force_default_requested, updates_suspended, suspended_since, last_successful_cover_url
+    reset_succeeded = True
     try:
         st = get_settings()
         force_default_requested = True
         updates_suspended = True
         suspended_since = datetime.now()
+        last_successful_cover_url = None
         if reason:
             _safe_log_error(ERROR_FALLBACK_RESET, reason)
 
         try:
             is_conn = getattr(bot_client, "is_connected", None)
             if callable(is_conn) and not is_conn():
-                try:
-                    write_track_info(None)
-                except (OSError, ValueError, TypeError):
-                    pass
-                default_media_applied = True
-                return
+                return False
         except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
             pass
 
@@ -400,6 +734,7 @@ async def reset_to_default_state(bot_client, reason: str = ""):
                 _safe_log_info(INFO_MEDIA_DEFAULT_UPDATED)
             except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                 _safe_log_error(ERROR_MEDIA_UPDATE, e)
+                reset_succeeded = False
         else:
             try:
                 await safe_call_telethon(
@@ -413,6 +748,7 @@ async def reset_to_default_state(bot_client, reason: str = ""):
                 _safe_log_info(INFO_MEDIA_DEFAULT_UPDATED)
             except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                 _safe_log_error(ERROR_MEDIA_UPDATE, e)
+                reset_succeeded = False
         try:
             await safe_call_telethon(
                 bot_client,
@@ -425,88 +761,57 @@ async def reset_to_default_state(bot_client, reason: str = ""):
             last_text_message_content = DEFAULT_MESSAGE
         except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
             _safe_log_error(ERROR_TEXT_UPDATE, e)
+            reset_succeeded = False
         try:
-            await update_channel_info(bot_client, DEFAULT_MESSAGE, False)
+            channel_info_ok = await update_channel_info(bot_client, DEFAULT_MESSAGE, False)
+            if not channel_info_ok:
+                reset_succeeded = False
         except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
             _safe_log_error(ERROR_CHANNEL_INFO_UPDATE, e)
+            reset_succeeded = False
+        if not reset_succeeded:
+            return False
         try:
             write_track_info(None)
         except (OSError, ValueError, TypeError):
-            pass
+            return False
 
         default_media_applied = True
+        return True
     except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError):
-        pass
+        return False
 
-async def update_messages(bot_client, cover_url, is_playing, artist_names, track_name, album_name, release_date, artist_urls, track_url, album_url, track_changed=False, current_track=None, genius_url=None, uploaded_photo=None):
-    global default_media_applied, last_text_message_content, force_default_requested
+async def update_messages(bot_client, cover_url, is_playing, artist_names, track_name, album_name, release_date, artist_urls, track_url, album_url, track_changed=False, current_track=None, genius_url=None, uploaded_photo=None, cover_media_unchanged=False, prepared_message_content=None, prepared_entities=None, commit_operations=None):
+    global default_media_applied, force_default_requested, last_successful_cover_url
+    update_ok = True
     try:
         st = get_settings()
         channel = PeerChannel(st.tg_channel_id)
         if is_playing:
-            track_name = track_name or ""
-            album_name = album_name or ""
-            release_date = release_date or ""
-            album_label = ALBUM_LABEL_ALBUM
-            item = current_track.get("item") if isinstance(current_track, dict) else None
-            if not (current_track and current_track.get("is_playing") and item and item.get("type") == "track"):
-                _safe_log_info(INFO_FALLBACK_TRACK_INFO)
-                artist_names_list, artist_urls_local = _split_artist_values(artist_names, artist_urls)
+            if isinstance(prepared_message_content, str) and isinstance(prepared_entities, list):
+                message_content = prepared_message_content
+                entities = list(prepared_entities)
             else:
-                artist_names_list = []
-                artist_urls_local = []
-                for a in (item.get("artists") or []):
-                    if not isinstance(a, dict):
-                        continue
-                    name = a.get("name")
-                    url = (a.get("external_urls") or {}).get("spotify")
-                    if not name:
-                        continue
-                    artist_names_list.append(str(name))
-                    artist_urls_local.append(str(url) if url else None)
-                total_tracks = _album_total_tracks_from_item(item)
-                if isinstance(total_tracks, int) and total_tracks > 0:
-                    album_label = ALBUM_LABEL_SINGLE if total_tracks <= 4 else ALBUM_LABEL_ALBUM
-
-            if not artist_names_list:
-                artist_names_list, artist_urls_local = _split_artist_values(artist_names, artist_urls)
-
-            message_content = ", ".join(artist_names_list) + " – " + track_name + "\n\n" + \
-                            f"{album_label}{album_name}\n" + \
-                            f"{RELEASE_DATE_PREFIX}{release_date}"
-
-            if genius_url:
-                message_content += f"\n\n{LYRICS_ON_GENIUS}"
-            entities = []
-            current_offset = 0
-            for i, name in enumerate(artist_names_list):
-                append_entity(entities, MessageEntityBold, current_offset, len(name))
-                if i < len(artist_urls_local) and artist_urls_local[i]:
-                    append_entity(entities, MessageEntityTextUrl, current_offset, len(name), url=artist_urls_local[i])
-                current_offset += len(name) + (2 if i < len(artist_names_list) - 1 else 0)
-            track_start = message_content.index(" – ") + len(" – ")
-            album_start = message_content.index(album_label) + len(album_label)
-            release_date_start = message_content.index(RELEASE_DATE_PREFIX) + len(RELEASE_DATE_PREFIX)
-            if track_name:
-                append_entity(entities, MessageEntityBold, track_start, len(track_name))
-                if track_url:
-                    append_entity(entities, MessageEntityTextUrl, track_start, len(track_name), url=track_url)
-            if album_name and album_url:
-                append_entity(entities, MessageEntityTextUrl, album_start, len(album_name), url=album_url)
-            if release_date:
-                append_entity(entities, types.MessageEntityItalic, release_date_start, len(release_date))
-            if genius_url:
-                lyrics_start = message_content.rindex(LYRICS_ON_GENIUS)
-                append_entity(entities, MessageEntityTextUrl, lyrics_start, len(LYRICS_ON_GENIUS), url=genius_url)
-                append_entity(entities, MessageEntityUnderline, lyrics_start, len(LYRICS_ON_GENIUS))
+                message_content, entities = _build_playing_message_payload(
+                    artist_names,
+                    track_name,
+                    album_name,
+                    release_date,
+                    artist_urls,
+                    track_url,
+                    album_url,
+                    current_track=current_track,
+                    genius_url=genius_url,
+                )
 
             async def update_text_task():
                 global last_text_message_content
                 global force_default_requested
+                nonlocal update_ok
 
                 now_playing_text = NOW_PLAYING_ON_SPOTIFY
-                if last_text_message_content == now_playing_text and not track_changed:
-                    return
+                if last_text_message_content == now_playing_text:
+                    return True
                 try:
                     text_entities = [
                         MessageEntityCode(offset=0, length=len(now_playing_text)),
@@ -522,14 +827,28 @@ async def update_messages(bot_client, cover_url, is_playing, artist_names, track
                         )
                     )
                     last_text_message_content = now_playing_text
+                    return True
                 except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                     _safe_log_error(ERROR_TEXT_UPDATE, e)
                     force_default_requested = True
+                    update_ok = False
+                    return False
 
             async def apply_media_message_task(uploaded_photo_param=None):
                 global force_default_requested
+                nonlocal update_ok
                 try:
-                    if cover_url:
+                    if cover_media_unchanged:
+                        await safe_call_telethon(
+                            bot_client,
+                            functions.messages.EditMessageRequest(
+                                peer=channel,
+                                id=st.tg_media_message_id,
+                                message=message_content,
+                                entities=entities
+                            )
+                        )
+                    elif cover_url:
                         if uploaded_photo_param is not None:
                             if isinstance(uploaded_photo_param, Photo):
                                 media_obj = types.InputMediaPhoto(id=get_input_photo(uploaded_photo_param))
@@ -567,67 +886,102 @@ async def update_messages(bot_client, cover_url, is_playing, artist_names, track
                             )
                         )
                     _safe_log_info(INFO_MEDIA_UPDATED)
+                    return True
                 except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                     _safe_log_error(ERROR_MEDIA_UPDATE, e)
                     force_default_requested = True
+                    update_ok = False
+                    return False
 
             default_media_applied = False
-            await asyncio.gather(update_text_task(), apply_media_message_task(uploaded_photo))
-            return uploaded_photo
+            commit_ops = [update_text_task(), apply_media_message_task(uploaded_photo)]
+            if commit_operations is not None:
+                commit_operations.extend(commit_ops)
+                return True
+            await asyncio.gather(*commit_ops)
+            return update_ok and (not force_default_requested)
         else:
+            last_successful_cover_url = None
             profile_picture = os.path.join(DIRS["SESSION"], DEFAULT_LOGO_PATH)
-            if os.path.exists(profile_picture):
-                if not default_media_applied:
+            async def apply_default_media_task():
+                global default_media_applied
+                nonlocal update_ok
+                if os.path.exists(profile_picture):
+                    if not default_media_applied:
+                        try:
+                            file = await bot_client.upload_file(profile_picture)
+                            input_media = types.InputMediaUploadedPhoto(file)
+                            await safe_call_telethon(
+                                bot_client,
+                                functions.messages.EditMessageRequest(
+                                    peer=channel,
+                                    id=st.tg_media_message_id,
+                                    message=DEFAULT_MESSAGE,
+                                    media=input_media
+                                )
+                            )
+                            _safe_log_info(INFO_MEDIA_DEFAULT_UPDATED)
+                            default_media_applied = True
+                        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
+                            _safe_log_error(ERROR_MEDIA_UPDATE, e)
+                            update_ok = False
+                            return False
+                return True
+
+            async def update_default_text_task():
+                global last_text_message_content
+                nonlocal update_ok
+                if last_text_message_content != DEFAULT_MESSAGE:
                     try:
-                        file = await bot_client.upload_file(profile_picture)
-                        input_media = types.InputMediaUploadedPhoto(file)
                         await safe_call_telethon(
                             bot_client,
                             functions.messages.EditMessageRequest(
                                 peer=channel,
-                                id=st.tg_media_message_id,
-                                message=DEFAULT_MESSAGE,
-                                media=input_media
+                                id=st.tg_text_message_id,
+                                message=DEFAULT_MESSAGE
                             )
                         )
-                        _safe_log_info(INFO_MEDIA_DEFAULT_UPDATED)
-                        default_media_applied = True
+                        last_text_message_content = DEFAULT_MESSAGE
                     except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
-                        _safe_log_error(ERROR_MEDIA_UPDATE, e)
-            global last_text_message_content
-            if last_text_message_content != DEFAULT_MESSAGE:
-                try:
-                    await safe_call_telethon(
-                        bot_client,
-                        functions.messages.EditMessageRequest(
-                            peer=channel,
-                            id=st.tg_text_message_id,
-                            message=DEFAULT_MESSAGE
-                        )
-                    )
-                    last_text_message_content = DEFAULT_MESSAGE
-                except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
-                    _safe_log_error(ERROR_TEXT_UPDATE, e)
-            return None
+                        _safe_log_error(ERROR_TEXT_UPDATE, e)
+                        update_ok = False
+                        return False
+                return True
+
+            commit_ops = [apply_default_media_task(), update_default_text_task()]
+            if commit_operations is not None:
+                commit_operations.extend(commit_ops)
+                return True
+            await asyncio.gather(*commit_ops)
+            return update_ok
     except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError) as e:
         _safe_log_error(ERROR_UPDATING_MESSAGES, e)
         force_default_requested = True
+        return False
 
-async def update_channel_info(bot_client, track_title, is_playing, uploaded_photo=None):
+async def update_channel_info(bot_client, track_title, is_playing, uploaded_photo=None, skip_photo_update=False, commit_operations=None):
+    global force_default_requested, last_successful_cover_url
+    update_ok = True
     try:
         st = get_settings()
         channel = PeerChannel(st.tg_channel_id)
         if not is_playing:
+            last_successful_cover_url = None
             channel_name = DEFAULT_MESSAGE
             profile_picture = os.path.join(DIRS["SESSION"], DEFAULT_LOGO_PATH)
 
             async def update_title_task():
+                nonlocal update_ok
                 try:
                     await safe_call_telethon(bot_client, EditTitleRequest(channel, channel_name))
+                    return True
                 except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                     _safe_log_error(ERROR_CHANNEL_TITLE_UPDATE, e)
+                    update_ok = False
+                    return False
 
             async def update_photo_task():
+                nonlocal update_ok
                 if os.path.exists(profile_picture):
                     try:
                         file = await bot_client.upload_file(profile_picture)
@@ -640,39 +994,66 @@ async def update_channel_info(bot_client, track_title, is_playing, uploaded_phot
                         )
                         if input_photo and getattr(input_photo, "photo", None):
                             await safe_call_telethon(bot_client, EditPhotoRequest(channel, input_photo.photo))
+                        return True
                     except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                         _safe_log_error(ERROR_CHANNEL_PHOTO_UPDATE, e)
+                        update_ok = False
+                        return False
+                return True
 
-            tasks = [update_title_task(), update_photo_task()]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            _safe_log_info(INFO_CHANNEL_DEFAULT_UPDATED)
+            commit_ops = [update_title_task(), update_photo_task()]
+            if commit_operations is not None:
+                commit_operations.extend(commit_ops)
+                return True
+            await asyncio.gather(*commit_ops, return_exceptions=True)
+            if update_ok:
+                _safe_log_info(INFO_CHANNEL_DEFAULT_UPDATED)
+            return update_ok
         else:
             async def update_title_task():
                 global force_default_requested
+                nonlocal update_ok
                 try:
                     await safe_call_telethon(bot_client, EditTitleRequest(channel, track_title))
+                    return True
                 except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                     _safe_log_error(ERROR_CHANNEL_TITLE_UPDATE, e)
                     force_default_requested = True
+                    update_ok = False
+                    return False
 
             async def update_photo_task():
                 global force_default_requested
+                nonlocal update_ok
+                if skip_photo_update:
+                    return True
                 if uploaded_photo is not None:
                     try:
                         if isinstance(uploaded_photo, Photo):
                             await safe_call_telethon(bot_client, EditPhotoRequest(channel, uploaded_photo))
                         else:
                             await safe_call_telethon(bot_client, EditPhotoRequest(channel, InputChatUploadedPhoto(uploaded_photo)))
+                        return True
                     except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                         _safe_log_error(ERROR_CHANNEL_PHOTO_UPDATE, e)
                         force_default_requested = True
+                        update_ok = False
+                        return False
+                return True
 
-            tasks = [update_title_task(), update_photo_task()]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if not force_default_requested:
+            commit_ops = [update_title_task(), update_photo_task()]
+            if commit_operations is not None:
+                commit_operations.extend(commit_ops)
+                return True
+            await asyncio.gather(*commit_ops, return_exceptions=True)
+            if update_ok and not force_default_requested:
                 _safe_log_info(INFO_CHANNEL_UPDATED)
-    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
+            return update_ok and (not force_default_requested)
+    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError) as e:
         _safe_log_error(ERROR_CHANNEL_INFO_UPDATE, e)
+        if is_playing:
+            force_default_requested = True
+        return False
 
 async def update_channel(bot_client, spotify_client):
     track_info = read_track_info()
@@ -716,82 +1097,38 @@ async def update_channel(bot_client, spotify_client):
             return None
         if is_playing and not track_changed:
             return track_id
-        genius_url = None
-        preuploaded_photo = None
-        phase1_tasks = []
-        if st.enable_genius and st.genius_access_token and is_playing and track_changed and track_id:
-            spotify_artists, album_total_tracks, spotify_release_date_iso = _extract_spotify_track_meta(current_track_raw)
-            async def _lyrics_task():
-                res = await search_lyrics_url(
-                    track_name,
-                    spotify_artists=spotify_artists,
-                    spotify_album_name=album_name,
-                    spotify_album_total_tracks=album_total_tracks,
-                    spotify_release_date=spotify_release_date_iso,
-                )
-                if isinstance(res, str) and res:
-                    return res
-                return None
-            phase1_tasks.append(asyncio.create_task(_lyrics_task()))
-        if is_playing and track_changed and cover_url:
-            channel = PeerChannel(st.tg_channel_id)
-            phase1_tasks.append(asyncio.create_task(_preupload_cover_photo(bot_client, cover_url, channel)))
+        commit_payload = await _collect_channel_commit_payload(
+            bot_client,
+            st=st,
+            track_title=track_title,
+            cover_url=cover_url,
+            track_id=track_id,
+            is_playing=is_playing,
+            artist_names=artist_names,
+            track_name=track_name,
+            album_name=album_name,
+            release_date=release_date,
+            artist_urls=artist_urls,
+            track_url=track_url,
+            album_url=album_url,
+            current_track_raw=current_track_raw,
+            track_changed=track_changed,
+        )
 
-        if phase1_tasks:
-            try:
-                phase1_results = await asyncio.gather(*phase1_tasks, return_exceptions=True)
-            except asyncio.CancelledError:
-                for t in phase1_tasks:
-                    try:
-                        if isinstance(t, asyncio.Task) and not t.done():
-                            t.cancel()
-                    except RuntimeError:
-                        pass
-                await asyncio.gather(*phase1_tasks, return_exceptions=True)
-                raise
-            for res in phase1_results:
-                if res is None or isinstance(res, BaseException):
-                    continue
-                if isinstance(res, (Photo, InputFile, InputFileBig)):
-                    preuploaded_photo = res
-                elif isinstance(res, str):
-                    genius_url = res
-
-        uploaded_photo_for_update = preuploaded_photo
-
-        if track_changed:
-            await asyncio.gather(
-                update_messages(
-                    bot_client=bot_client,
-                    cover_url=cover_url,
-                    is_playing=is_playing,
-                    artist_names=artist_names,
-                    track_name=track_name,
-                    album_name=album_name,
-                    release_date=release_date,
-                    artist_urls=artist_urls,
-                    track_url=track_url,
-                    album_url=album_url,
-                    track_changed=track_changed,
-                    current_track=current_track_raw if is_playing else None,
-                    genius_url=genius_url,
-                    uploaded_photo=uploaded_photo_for_update,
-                ),
-                update_channel_info(
-                    bot_client,
-                    track_title,
-                    is_playing,
-                    uploaded_photo=uploaded_photo_for_update,
-                ),
-                return_exceptions=True,
-            )
+        commit_ok = await _commit_channel_commit_payload(
+            bot_client,
+            commit_payload,
+            track_changed=track_changed,
+        )
+        if track_changed and not commit_ok:
             if force_default_requested:
                 suspended_on_track_id = track_id if is_playing else None
                 try:
-                    await reset_to_default_state(bot_client, REASON_TELEGRAM_UPDATE_FAILED)
+                    reset_ok = await reset_to_default_state(bot_client, REASON_TELEGRAM_UPDATE_FAILED)
                 except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError) as e:
                     _safe_log_error(ERROR_TEXT_UPDATE, e)
-                return None
+                    reset_ok = False
+                return None if reset_ok else cached_track_id
 
         if force_default_requested:
             return None

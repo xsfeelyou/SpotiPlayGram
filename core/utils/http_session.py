@@ -1,4 +1,4 @@
-﻿import aiohttp
+import aiohttp
 from typing import Optional
 
 _session: Optional[aiohttp.ClientSession] = None
@@ -9,7 +9,7 @@ def init_session() -> aiohttp.ClientSession:
     global _connector
     if _session is None or _session.closed:
         if _connector is None or _connector.closed:
-            _connector = aiohttp.TCPConnector(limit=256, ttl_dns_cache=300)
+            _connector = aiohttp.TCPConnector(limit=256, limit_per_host=256, ttl_dns_cache=300)
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30.0),
             connector=_connector,

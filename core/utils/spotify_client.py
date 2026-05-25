@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
 import os
 import threading
+import time
 from typing import Any, Optional
 
 import aiohttp
@@ -107,18 +108,79 @@ class AsyncSpotifyClient:
         self._session = session or init_session()
         self._timeout = aiohttp.ClientTimeout(total=float(request_timeout))
         self._language = language or "EN"
+        self._access_token = ""
+        self._access_token_expires_at = 0.0
+        self._token_lock = asyncio.Lock()
+        self._token_refresh_margin = 60.0
+        self._token_fallback_ttl = 300.0
 
-    async def _get_access_token(self) -> str:
-        try:
-            token = await asyncio.to_thread(self._auth.get_access_token, as_dict=False)
-        except TypeError:
-            token = await asyncio.to_thread(self._auth.get_access_token)
+    def _cached_token_valid(self, now: float) -> bool:
+        return bool(self._access_token and self._access_token_expires_at > now + self._token_refresh_margin)
+
+    def _extract_token_data(self, token: Any, now: float) -> tuple[str, float]:
         if token is None:
-            return ""
+            return "", 0.0
         if isinstance(token, dict):
             value = token.get("access_token")
-            return str(value) if value else ""
-        return str(token) if token else ""
+            if not value:
+                return "", 0.0
+            expires_at_raw = token.get("expires_at")
+            expires_at = float(expires_at_raw) if isinstance(expires_at_raw, (int, float)) else 0.0
+            if expires_at <= now:
+                expires_in_raw = token.get("expires_in")
+                expires_in = float(expires_in_raw) if isinstance(expires_in_raw, (int, float)) and expires_in_raw > 0 else self._token_fallback_ttl
+                expires_at = now + expires_in
+            return str(value), expires_at
+        return str(token) if token else "", now + self._token_fallback_ttl
+
+    async def _refresh_access_token(self, now: float) -> tuple[str, float]:
+        cache_handler = getattr(self._auth, "cache_handler", None)
+        get_cached_token = getattr(cache_handler, "get_cached_token", None)
+        if not callable(get_cached_token):
+            return "", 0.0
+        try:
+            cached_token = await asyncio.to_thread(get_cached_token)
+        except Exception:
+            return "", 0.0
+        if not isinstance(cached_token, dict):
+            return "", 0.0
+        refresh_token = cached_token.get("refresh_token")
+        if not refresh_token:
+            return "", 0.0
+        refresh_access_token = getattr(self._auth, "refresh_access_token", None)
+        if not callable(refresh_access_token):
+            return "", 0.0
+        try:
+            token = await asyncio.to_thread(refresh_access_token, refresh_token)
+        except Exception:
+            return "", 0.0
+        return self._extract_token_data(token, now)
+
+    async def _load_access_token(self, *, force_refresh: bool = False) -> tuple[str, float]:
+        now = time.time()
+        if force_refresh:
+            token, expires_at = await self._refresh_access_token(now)
+            if token:
+                return token, expires_at
+            return "", 0.0
+        try:
+            token = await asyncio.to_thread(self._auth.get_access_token, as_dict=True)
+        except TypeError:
+            token = await asyncio.to_thread(self._auth.get_access_token)
+        return self._extract_token_data(token, now)
+
+    async def _get_access_token(self, *, force_refresh: bool = False) -> str:
+        now = time.time()
+        if not force_refresh and self._cached_token_valid(now):
+            return self._access_token
+        async with self._token_lock:
+            now = time.time()
+            if not force_refresh and self._cached_token_valid(now):
+                return self._access_token
+            token, expires_at = await self._load_access_token(force_refresh=force_refresh)
+            self._access_token = token
+            self._access_token_expires_at = expires_at
+            return token
 
     async def _safe_json(self, resp: aiohttp.ClientResponse) -> Optional[dict[str, Any]]:
         try:
@@ -147,7 +209,7 @@ class AsyncSpotifyClient:
                     if 200 <= resp.status < 300:
                         return await self._safe_json(resp)
                     if resp.status == 401 and attempt == 0:
-                        token = await self._get_access_token()
+                        token = await self._get_access_token(force_refresh=True)
                         if not token:
                             return None
                         continue

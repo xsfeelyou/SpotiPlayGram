@@ -1,9 +1,11 @@
-﻿import unicodedata
+import unicodedata
 import re
 import json
 import os
 import importlib
-from typing import Optional, Iterable, Any
+from itertools import combinations
+from functools import lru_cache
+from typing import Optional, Iterable, Any, Iterator
 try:
     from anyascii import anyascii as _anyascii_impl
 except ImportError:
@@ -95,16 +97,6 @@ def _read_json_obj_raw(path: str) -> Any:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
 
-def _read_json_list_raw(path: str) -> list[str] | None:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    if not isinstance(data, list):
-        return None
-    return [str(x) for x in data if x is not None]
-
 def _load_builtin_patterns(module_name: str, attr: str) -> list[str]:
     try:
         mod = importlib.import_module(f".{module_name}", package=__package__)
@@ -112,19 +104,6 @@ def _load_builtin_patterns(module_name: str, attr: str) -> list[str]:
         return []
     value = getattr(mod, attr, None)
     return list(value) if isinstance(value, (list, tuple)) else []
-
-def _read_json_list(path: str) -> list[str] | None:
-    items = _read_json_list_raw(path)
-    if items is None:
-        return None
-    return _unique_sorted(items)
-
-def _write_json_list(path: str, items: Iterable[str]) -> None:
-    out = _unique_sorted(items)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
 
 def _ensure_user_patterns_dir() -> None:
     try:
@@ -257,13 +236,11 @@ def _persist_user_deltas(
             pass
 
 def get_feat_patterns_version() -> int:
-    global _FEAT_CACHE
     if _FEAT_CACHE is None:
         get_feat_patterns()
     return _FEAT_VERSION
 
 def get_tag_patterns_version() -> int:
-    global _TAG_CACHE
     if _TAG_CACHE is None:
         get_tag_patterns()
     return _TAG_VERSION
@@ -553,13 +530,7 @@ def generate_roman_l_i_variants(text: Optional[str]) -> list[str]:
             variants.append(v)
     return variants or [s]
 
-def generate_symbol_letter_equiv_variants(text: Optional[str]) -> list[str]:
-    if text is None:
-        return []
-    s = str(text)
-    if not s:
-        return []
-
+def _symbol_letter_positions(s: str) -> tuple[list[int], list[str]]:
     positions: list[int] = []
     repl_chars: list[str] = []
     for idx, ch in enumerate(s):
@@ -568,22 +539,57 @@ def generate_symbol_letter_equiv_variants(text: Optional[str]) -> list[str]:
             if mapped != ch:
                 positions.append(idx)
                 repl_chars.append(mapped)
+    return positions, repl_chars
+
+@lru_cache(maxsize=2048)
+def _symbol_letter_equiv_layout_cached(text: str) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    s = str(text)
+    if not s:
+        return (), ()
+    positions, repl_chars = _symbol_letter_positions(s)
+    return tuple(positions), tuple(repl_chars)
+
+def iter_symbol_letter_equiv_variants(text: Optional[str], limit: Optional[int] = None) -> Iterator[str]:
+    if text is None:
+        return
+    s = str(text)
+    if not s:
+        return
+
+    limit_int: Optional[int] = None
+    if limit is not None:
+        try:
+            limit_int = int(limit)
+        except (TypeError, ValueError, OverflowError):
+            limit_int = 0
+        if limit_int <= 0:
+            return
+
+    positions_raw, repl_chars_raw = _symbol_letter_equiv_layout_cached(s)
+    positions = list(positions_raw)
+    repl_chars = list(repl_chars_raw)
 
     if not positions:
-        return [s]
+        yield s
+        return
 
     n = len(positions)
-    variants: list[str] = []
+    seen: set[str] = set()
+    emitted = 0
 
-    for mask in range(1 << n):
-        chars = list(s)
-        for bit, pos in enumerate(positions):
-            if (mask >> bit) & 1:
-                chars[pos] = repl_chars[bit]
-        v = "".join(chars)
-        if v not in variants:
-            variants.append(v)
-    return variants or [s]
+    for replace_count in range(0, n + 1):
+        for replace_indexes in combinations(range(n), replace_count):
+            chars = list(s)
+            for bit in replace_indexes:
+                chars[positions[bit]] = repl_chars[bit]
+            v = "".join(chars)
+            if v in seen:
+                continue
+            seen.add(v)
+            yield v
+            emitted += 1
+            if limit_int is not None and emitted >= limit_int:
+                return
 
 def normalize_letters(text: str) -> str:
     if not text:

@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import asyncio
 from subprocess import call
@@ -67,6 +67,7 @@ from constants import (
 from config import Settings, EnvValidationError
 
 from utils.http_session import init_session, close_session
+from utils.mistral_client import close_mistral_client, prefetch_mistral_client
 from utils.spotify_client import AsyncSpotifyClient, get_spg_cache_handler
 from utils.update_libs import schedule_daily_update_check
 from aiohttp import ClientTimeout, ClientError
@@ -307,6 +308,39 @@ async def _check_genius_and_mistral(settings: Settings) -> bool:
             return False
     return False
 
+async def _prefetch_runtime_state(
+    settings: Settings,
+    *,
+    genius_search_module,
+    mistral_ai_module,
+    mistral_valid: bool,
+) -> None:
+    runtime_tasks: list[asyncio.Task] = []
+    if settings.enable_genius and settings.genius_access_token:
+        try:
+            prefetch_genius_runtime = getattr(genius_search_module, "prefetch_search_runtime", None)
+            if callable(prefetch_genius_runtime):
+                runtime_tasks.append(asyncio.create_task(prefetch_genius_runtime()))
+        except (AttributeError, TypeError, RuntimeError, ValueError, OSError):
+            pass
+
+    if settings.enable_mistral and settings.mistral_api_key:
+        try:
+            read_mistral_model = getattr(mistral_ai_module, "read_mistral_model", None)
+            if callable(read_mistral_model):
+                read_mistral_model()
+        except (AttributeError, TypeError, RuntimeError, ValueError, OSError):
+            pass
+
+        if mistral_valid:
+            try:
+                runtime_tasks.append(asyncio.create_task(prefetch_mistral_client(settings.mistral_api_key)))
+            except (AttributeError, TypeError, RuntimeError, ValueError, OSError):
+                pass
+
+    if runtime_tasks:
+        await asyncio.gather(*runtime_tasks, return_exceptions=True)
+
 async def main():
     try:
         settings = Settings.from_env()
@@ -380,7 +414,6 @@ async def main():
             pass
 
     async def shutdown_cb():
-        nonlocal update_task
         _mark_shutting_down()
         try:
             if update_task is not None and not update_task.done():
@@ -404,6 +437,10 @@ async def main():
         except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
             pass
         try:
+            await close_mistral_client()
+        except (ClientError, OSError, RuntimeError, AttributeError, TypeError, ValueError):
+            pass
+        try:
             await close_session()
         except (ClientError, OSError, RuntimeError):
             pass
@@ -424,6 +461,12 @@ async def main():
         )
         spotify = await _start_spotify(settings)
         mistral_valid = await _check_genius_and_mistral(settings)
+        await _prefetch_runtime_state(
+            settings,
+            genius_search_module=genius_search_module,
+            mistral_ai_module=mistral_ai_module,
+            mistral_valid=mistral_valid,
+        )
         bot_module.set_mistral_api_key_valid(mistral_valid)
 
         await bot_module.setup_bot_commands(bot, user)

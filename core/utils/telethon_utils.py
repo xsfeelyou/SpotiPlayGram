@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 from typing import Any, Optional, Callable
 import aiohttp
 from telethon.errors import RPCError

@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import logging.handlers
 import os
 import re
@@ -15,9 +15,6 @@ _DEFAULT_EXCLUDED_DIRS = {
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-def _normalize_path(path: str) -> str:
-    return os.path.normcase(os.path.abspath(path))
-
 def _is_project_python_file(
     path: str,
     root_dir: str,
@@ -27,8 +24,8 @@ def _is_project_python_file(
     try:
         if not path or not root_dir:
             return False
-        path_abs = _normalize_path(path)
-        root_abs = _normalize_path(root_dir)
+        path_abs = os.path.normcase(os.path.abspath(path))
+        root_abs = os.path.normcase(os.path.abspath(root_dir))
         if not path_abs.lower().endswith(".py"):
             return False
         try:
@@ -64,7 +61,7 @@ class ProjectAwareFormatter(logging.Formatter):
         excluded_files: Optional[Iterable[str]] = None,
     ):
         super().__init__(fmt=fmt, datefmt=datefmt, style=style)
-        self.root_dir = _normalize_path(root_dir or os.getcwd())
+        self.root_dir = os.path.normcase(os.path.abspath(root_dir or os.getcwd()))
         self.excluded_dirs = {seg.lower() for seg in (excluded_dirs or _DEFAULT_EXCLUDED_DIRS)}
         if excluded_files is None:
             excluded_files = [__file__]
@@ -191,10 +188,10 @@ class LoggerConfig:
         install_excepthook: bool = True,
         duplicate_errors: bool = True,
     ):
-        self.root_dir = _normalize_path(root_dir or os.getcwd())
+        self.root_dir = os.path.normcase(os.path.abspath(root_dir or os.getcwd()))
         if log_dir is None:
             log_dir = os.path.join(self.root_dir, "logs")
-        self.log_dir = _normalize_path(log_dir) if log_dir else None
+        self.log_dir = os.path.normcase(os.path.abspath(log_dir)) if log_dir else None
         self.excluded_dirs = {seg.lower() for seg in (excluded_dirs or _DEFAULT_EXCLUDED_DIRS)}
         if excluded_files is None:
             excluded_files = [__file__]

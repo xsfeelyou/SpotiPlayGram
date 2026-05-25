@@ -1,4 +1,4 @@
-﻿import os
+import os
 
 LOG_FORMAT_SPOTIFY = " \033[92mSpotify\033[0m | "
 LOG_FORMAT_TELEGRAM = "\033[94mTelegram\033[0m | "
@@ -154,7 +154,7 @@ REASON_EMPTY_JSON_RESPONSE = "empty response body"
 INFO_GENIUS_DISABLED = f"{LOG_FORMAT_GENIUS}Genius is disabled"
 ERROR_AUTH_GENIUS_INVALID_TOKEN = f"{LOG_FORMAT_GENIUS}Token is missing. Set GENIUS_ACCESS_TOKEN in .env"
 
-INFO_GENIUS_SEARCH_QUERY = f"{LOG_FORMAT_GENIUS}GET /search: {{0}}"
+INFO_GENIUS_SEARCH_QUERY = f"{LOG_FORMAT_GENIUS}GET /search ({{0}}): {{1}}"
 INFO_TRANSLATION_REPLACED = f"{LOG_FORMAT_GENIUS}Translation replaced with original: {{0}} → {{1}}"
 INFO_GENIUS_NO_RESULTS = f"{LOG_FORMAT_GENIUS}No suitable songs found"
 INFO_GENIUS_SCORING_CHOSEN = f"{LOG_FORMAT_GENIUS}Chosen URL: {{0}}"
@@ -179,14 +179,12 @@ INFO_MISTRAL_SAVING = "⏳ Saving and validating selected models…"
 INFO_MISTRAL_ENTER_MODEL = "Enter model IDs separated by space or comma in priority order (copy from the list above).\nFor reasoning models you can add reasoning_effort as <code>model=effort</code>.\nIf <code>model=effort</code> is not specified, the model's default effort is used.\nExample: <code>mistral-large-latest, mistral-small-latest=high</code>"
 INFO_MISTRAL_MODEL_SAVED = "✅ Models updated to:\n{0}\n\nThe change will take effect on the next Spotify status update."
 INFO_MISTRAL_MODEL_UPDATED = f"{LOG_FORMAT_MISTRAL}Model updated: {{0}}"
-INFO_MISTRAL_MENU_DISABLED = "⚠️ Mistral menu is disabled (ENABLE_MISTRAL = False)"
 ERROR_MISTRAL_FETCH_MODELS = "⚠️ Failed to fetch model list: {0}"
 ERROR_MISTRAL_MODEL_INVALID = "⚠️ Invalid model. Please choose one from the list above"
 ERROR_MISTRAL_MODEL_FORMAT = "⚠️ Invalid input format. Enter model IDs separated by space or comma.\nFor reasoning models use <code>model=effort</code>.\nIf <code>model=effort</code> is not specified, the model's default effort is used.\nExample: <code>mistral-large-latest, mistral-small-latest=high</code>"
 
 INFO_MISTRAL_SWITCH_MODEL = f"{LOG_FORMAT_MISTRAL}Trying model: {{0}}"
 ERROR_MISTRAL_SDK_MISSING = f"{LOG_FORMAT_MISTRAL}The 'mistralai' library is not installed"
-ERROR_MISTRAL_INIT = f"{LOG_FORMAT_MISTRAL}Client initialization error: {{0}}"
 ERROR_MISTRAL_TIMEOUT = f"{LOG_FORMAT_MISTRAL}Request timeout: model {{0}}, {{1}} sec"
 INFO_MISTRAL_DISABLED = f"{LOG_FORMAT_MISTRAL}Disabled"
 ERROR_MISTRAL_API_KEY_INVALID = f"{LOG_FORMAT_MISTRAL}Invalid MISTRAL_API_KEY or access denied"
@@ -195,8 +193,8 @@ ERROR_MISTRAL_REQUEST = f"{LOG_FORMAT_MISTRAL}Request error: {{0}}"
 MISTRAL_TIMEOUT_SECONDS = 30
 
 GENIUS_TIMEOUT_SECONDS = 30
-GENIUS_SEARCH_CONCURRENCY = 100
-SEARCH_VARIANTS_LIMIT = 100
+GENIUS_SEARCH_CONCURRENCY = 128
+SEARCH_VARIANTS_LIMIT = 128
 GENIUS_SEARCH_PER_PAGE = 10
 GENIUS_DETAILS_TOP_N = 10
 GENIUS_FUZZY_TOKENS_PERCENT = 0.51
@@ -206,12 +204,13 @@ GENIUS_TAG_FUZZY_CHARS_PERCENT = 0.9
 
 INFO_MISTRAL_FINAL_SELECTION_START = f"{LOG_FORMAT_MISTRAL}Selecting the correct lyrics URL... (model {{0}})"
 INFO_MISTRAL_FINAL_SELECTION_NONE = f"{LOG_FORMAT_MISTRAL}No candidate selected; assuming no suitable songs"
+INFO_MISTRAL_FINAL_SELECTION_NONE_CACHED = f"{LOG_FORMAT_MISTRAL}Using cached 'no candidate selected' result; assuming no suitable songs"
+INFO_MISTRAL_FINAL_SELECTION_NONE_INFLIGHT = f"{LOG_FORMAT_MISTRAL}Using shared in-flight 'no candidate selected' result; assuming no suitable songs"
 ERROR_MISTRAL_FINAL_SELECTION = f"{LOG_FORMAT_MISTRAL}Final selection error: {{0}}"
 
 GENIUS_SCORE_TRACK_EXACT_TITLE_BONUS = 25
 GENIUS_SCORE_TAG_PHRASE_IN_TITLE = 25
 GENIUS_SCORE_TAG_PHRASE_IN_TITLE_FEAT = 25
-GENIUS_SCORE_TAG_HITS_TITLE = 25
 GENIUS_SCORE_TAG_TOKENS_PER = 25
 GENIUS_SCORE_TAG_TOKENS_MAX = 100
 GENIUS_PENALTY_TAG_MISSING = 10

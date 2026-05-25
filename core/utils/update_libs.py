@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ast
 import asyncio
@@ -92,9 +92,6 @@ def _upgrade_packages(pip_names: list[str]) -> None:
         check=True,
     )
 
-def _restart_process() -> None:
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
 def _seconds_until_next_utc(hhmm: str) -> float:
     try:
         parts = hhmm.strip().split(":")
@@ -168,7 +165,7 @@ async def schedule_daily_update_check(
 
             _upgrade_packages(to_update)
             _safe_log_info(INFO_DEP_UPDATES_DONE)
-            _restart_process()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         except asyncio.CancelledError:
             raise
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError, TypeError, RuntimeError, asyncio.TimeoutError, ConnectionError) as e:

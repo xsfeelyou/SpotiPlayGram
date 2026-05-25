@@ -1,4 +1,4 @@
-﻿import re
+import re
 import html
 import aiohttp
 from telethon import events, Button
@@ -110,9 +110,6 @@ def get_settings() -> Settings:
         raise RuntimeError("Settings are not initialized")
     return _settings
 
-def _is_mistral_ui_enabled(st: Settings) -> bool:
-    return bool(st.enable_mistral and _mistral_api_key_valid)
-
 async def _edit_or_respond(message, event, text: str, *, parse_mode: Optional[str] = None, buttons=None) -> None:
     if message:
         try:
@@ -141,6 +138,8 @@ class BotState:
     shutting_down: bool = False
     update_loop_last_log_ts: float = 0.0
     update_loop_last_log_sig: str = ""
+    cleanup_task: Optional[asyncio.Task] = None
+    cleanup_requested: bool = False
 
     current_menu: str = "main"
     awaiting_mistral_model_input: bool = False
@@ -184,9 +183,19 @@ def mark_shutting_down() -> None:
     state.tg_next_retry_ts = 0.0
     state.tg_last_disconnect_log_ts = 0.0
     _cancel_update_task(state)
+    _cancel_cleanup_task(state)
 
 def _cancel_update_task(state: BotState) -> None:
     task = getattr(state, "update_task", None)
+    if task is not None and isinstance(task, asyncio.Task) and not task.done():
+        try:
+            task.cancel()
+        except RuntimeError:
+            pass
+
+def _cancel_cleanup_task(state: BotState) -> None:
+    task = getattr(state, "cleanup_task", None)
+    state.cleanup_requested = False
     if task is not None and isinstance(task, asyncio.Task) and not task.done():
         try:
             task.cancel()
@@ -229,6 +238,27 @@ async def delete_all_messages(user_client, channel_id):
         _safe_log_info(INFO_MESSAGE_DELETED, mid)
     return
 
+async def _run_serial_channel_cleanup(state: BotState, user_client, channel_id: int) -> None:
+    try:
+        while state.cleanup_requested and not state.shutting_down:
+            state.cleanup_requested = False
+            try:
+                await delete_all_messages(user_client, channel_id)
+            except asyncio.CancelledError:
+                raise
+            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, aiohttp.ClientError, RuntimeError, ValueError, TypeError):
+                pass
+    finally:
+        if state.cleanup_task is asyncio.current_task():
+            state.cleanup_task = None
+
+def _schedule_channel_cleanup(state: BotState, user_client, channel_id: int) -> None:
+    state.cleanup_requested = True
+    task = state.cleanup_task
+    if task is not None and not task.done():
+        return
+    state.cleanup_task = asyncio.create_task(_run_serial_channel_cleanup(state, user_client, channel_id))
+
 async def _apply_default_state(
     *,
     bot_client,
@@ -236,47 +266,48 @@ async def _apply_default_state(
     update_messages,
     update_channel_info,
     suppress_errors: bool,
-) -> None:
-    if suppress_errors:
-        try:
-            write_track_info(None)
-        except (OSError, ValueError, TypeError):
-            pass
-        try:
-            await update_messages(
-                bot_client=bot_client,
-                cover_url=None,
-                is_playing=False,
-                artist_names=None,
-                track_name=None,
-                album_name=None,
-                release_date=None,
-                artist_urls=None,
-                track_url=None,
-                album_url=None,
-            )
-        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
-            pass
-        try:
-            await update_channel_info(bot_client, DEFAULT_MESSAGE, False)
-        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
-            pass
-        return
-
-    write_track_info(None)
-    await update_messages(
-        bot_client=bot_client,
-        cover_url=None,
-        is_playing=False,
-        artist_names=None,
-        track_name=None,
-        album_name=None,
-        release_date=None,
-        artist_urls=None,
-        track_url=None,
-        album_url=None,
+) -> bool:
+    commit_results = await asyncio.gather(
+        update_messages(
+            bot_client=bot_client,
+            cover_url=None,
+            is_playing=False,
+            artist_names=None,
+            track_name=None,
+            album_name=None,
+            release_date=None,
+            artist_urls=None,
+            track_url=None,
+            album_url=None,
+        ),
+        update_channel_info(bot_client, DEFAULT_MESSAGE, False),
+        return_exceptions=True,
     )
-    await update_channel_info(bot_client, DEFAULT_MESSAGE, False)
+
+    commit_ok = True
+    first_error: Optional[BaseException] = None
+    for res in commit_results:
+        if isinstance(res, BaseException):
+            commit_ok = False
+            if first_error is None:
+                first_error = res
+        elif res is not True:
+            commit_ok = False
+
+    if not commit_ok:
+        if suppress_errors:
+            return False
+        if first_error is not None:
+            raise first_error
+        return False
+
+    try:
+        write_track_info(None)
+    except (OSError, ValueError, TypeError):
+        if suppress_errors:
+            return False
+        raise
+    return True
 
 async def setup_bot_commands(bot, user):
     st = get_settings()
@@ -330,7 +361,7 @@ async def setup_bot_commands(bot, user):
             await event.respond(ACCESS_DENIED_MESSAGE)
 
     async def show_mistral_menu(event):
-        if not _is_mistral_ui_enabled(st):
+        if not bool(st.enable_mistral and _mistral_api_key_valid):
             state.set_menu("genius")
             await show_genius_settings_menu(event)
             return
@@ -437,7 +468,7 @@ async def setup_bot_commands(bot, user):
     async def show_genius_settings_menu(event):
         chat = await event.get_input_chat()
         buttons = []
-        mistral_ui_enabled = _is_mistral_ui_enabled(st)
+        mistral_ui_enabled = bool(st.enable_mistral and _mistral_api_key_valid)
         if mistral_ui_enabled:
             buttons.append([Button.text(BTN_MENU_MISTRAL, resize=True)])
         buttons.append([Button.text(BTN_MENU_TAG_PATTERNS, resize=True), Button.text(BTN_MENU_FEAT_PATTERNS, resize=True)])
@@ -529,7 +560,7 @@ async def setup_bot_commands(bot, user):
                 )
                 return
             if text == BTN_MENU_MISTRAL:
-                if not _is_mistral_ui_enabled(st):
+                if not bool(st.enable_mistral and _mistral_api_key_valid):
                     state.set_menu("genius")
                     await show_genius_settings_menu(event)
                     return
@@ -609,10 +640,6 @@ async def setup_bot_commands(bot, user):
                         state.control_message_event = enabling_msg
                     except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
                         state.control_message_event = None
-                    try:
-                        await delete_all_messages(user, st.tg_channel_id)
-                    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
-                        pass
                     return
                 if text == BTN_DISABLE:
                     if state.disable_in_progress or state.enable_in_progress:
@@ -633,17 +660,15 @@ async def setup_bot_commands(bot, user):
                             pass
 
                         try:
-                            await _apply_default_state(
+                            default_applied = await _apply_default_state(
                                 bot_client=bot,
                                 write_track_info=write_track_info,
                                 update_messages=update_messages,
                                 update_channel_info=update_channel_info,
                                 suppress_errors=True,
                             )
-                            try:
-                                await delete_all_messages(user, st.tg_channel_id)
-                            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
-                                pass
+                            if default_applied:
+                                _schedule_channel_cleanup(state, user, st.tg_channel_id)
                         except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError):
                             pass
 
@@ -997,13 +1022,15 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                         if not ok:
                             await asyncio.sleep(max(sleep_seconds, retry_in))
                             continue
-                        await _apply_default_state(
+                        default_applied = await _apply_default_state(
                             bot_client=bot_client,
                             write_track_info=write_track_info,
                             update_messages=update_messages,
                             update_channel_info=update_channel_info,
                             suppress_errors=False,
                         )
+                        if default_applied:
+                            _schedule_channel_cleanup(state, user_client, st.tg_channel_id)
                 else:
                     ok, retry_in = await _ensure_tg_connected()
                     if not ok:
@@ -1024,11 +1051,7 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                     if state.status_enabled:
                         wrote = write_track_info(track_id_result)
                     if wrote:
-                        ok, retry_in = await _ensure_tg_connected()
-                        if not ok:
-                            await asyncio.sleep(max(sleep_seconds, retry_in))
-                            continue
-                        await delete_all_messages(user_client, st.tg_channel_id)
+                        _schedule_channel_cleanup(state, user_client, st.tg_channel_id)
                         try:
                             if callable(apply_pending_reload):
                                 feat_applied, tag_applied = apply_pending_reload()

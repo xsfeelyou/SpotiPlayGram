@@ -1,4 +1,4 @@
-﻿import os
+import os
 import subprocess
 import sys
 import time
@@ -31,9 +31,6 @@ class StartConfig:
         self.upgrade_pip = upgrade_pip
         self.use_system_python = use_system_python
         self.quiet_pip = quiet_pip
-
-def _get_base_dir() -> str:
-    return os.path.dirname(os.path.abspath(__file__))
 
 def _resolve_path(base_dir: str, path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
@@ -99,7 +96,7 @@ def _select_python_executable(config: StartConfig, base_dir: str) -> str:
 
 def setup_and_run(config: Optional[StartConfig] = None) -> None:
     config = config or StartConfig()
-    base_dir = _get_base_dir()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
 
     python_executable = _select_python_executable(config, base_dir)
     if config.upgrade_pip:
