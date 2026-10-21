@@ -1,0 +1,9 @@
+* text=auto
+
+*.py text
+*.md text
+*.json text
+
+*.png binary
+*.session binary
+*.session-journal binary

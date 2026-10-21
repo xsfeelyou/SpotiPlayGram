@@ -18,7 +18,7 @@ from constants import (
     GENIUS_TIMEOUT_SECONDS,
     REASON_EMPTY_JSON_RESPONSE,
 )
-from logger import _safe_log_error
+from logger import _safe_log_error, dev_logger
 from utils.http_session import init_session
 
 API_BASE = "https://api.genius.com"
@@ -105,7 +105,6 @@ class AsyncGeniusClient:
             timeout_seconds = min(timeout_seconds, 4.0)
             retry_delay_cap = 4.0
             retry_after_cap = 10.0
-
         return retries, base_delay, timeout_seconds, retry_delay_cap, retry_after_cap
 
     async def get(self, path: str, params: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
@@ -224,27 +223,20 @@ class AsyncGeniusClient:
         if inflight is None:
             inflight = asyncio.create_task(_load_search())
             _GENIUS_SEARCH_INFLIGHT[cache_key] = inflight
-            try:
-                hits = await inflight
-            except asyncio.CancelledError:
-                try:
-                    inflight.cancel()
-                except RuntimeError:
-                    pass
-                raise
-            except Exception:
-                return []
-            finally:
-                if _GENIUS_SEARCH_INFLIGHT.get(cache_key) is inflight:
-                    _GENIUS_SEARCH_INFLIGHT.pop(cache_key, None)
-            cloned_hits = _clone_cached_value(hits)
-            return cloned_hits if isinstance(cloned_hits, list) else hits
 
+            def _clear_search_task(task, key=cache_key):
+                if _GENIUS_SEARCH_INFLIGHT.get(key) is task:
+                    _GENIUS_SEARCH_INFLIGHT.pop(key, None)
+                if not task.cancelled():
+                    task.exception()
+
+            inflight.add_done_callback(_clear_search_task)
         try:
-            hits = await inflight
+            hits = await asyncio.shield(inflight)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
+            _safe_log_error(ERROR_GENIUS_HTTP, "EXC", self._format_error_detail(e), logger=dev_logger)
             return []
         cloned_hits = _clone_cached_value(hits)
         return cloned_hits if isinstance(cloned_hits, list) else []
@@ -263,27 +255,20 @@ class AsyncGeniusClient:
         if inflight is None:
             inflight = asyncio.create_task(_load_song())
             _GENIUS_SONG_INFLIGHT[song_id] = inflight
-            try:
-                song = await inflight
-            except asyncio.CancelledError:
-                try:
-                    inflight.cancel()
-                except RuntimeError:
-                    pass
-                raise
-            except Exception:
-                return None
-            finally:
-                if _GENIUS_SONG_INFLIGHT.get(song_id) is inflight:
-                    _GENIUS_SONG_INFLIGHT.pop(song_id, None)
-            cloned_song = _clone_cached_value(song)
-            return cloned_song if isinstance(cloned_song, dict) or cloned_song is None else song
 
+            def _clear_song_task(task, key=song_id):
+                if _GENIUS_SONG_INFLIGHT.get(key) is task:
+                    _GENIUS_SONG_INFLIGHT.pop(key, None)
+                if not task.cancelled():
+                    task.exception()
+
+            inflight.add_done_callback(_clear_song_task)
         try:
-            song = await inflight
+            song = await asyncio.shield(inflight)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
+            _safe_log_error(ERROR_GENIUS_HTTP, "EXC", self._format_error_detail(e), logger=dev_logger)
             return None
         cloned_song = _clone_cached_value(song)
         return cloned_song if isinstance(cloned_song, dict) or cloned_song is None else None

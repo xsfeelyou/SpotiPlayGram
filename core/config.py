@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+import math
 import os
 
 from constants import (
@@ -15,8 +16,10 @@ from constants import (
     ERROR_AUTH_SPOTIFY_CLIENT_ID_MISSING,
     ERROR_AUTH_SPOTIFY_CLIENT_SECRET_MISSING,
     ERROR_AUTH_SPOTIFY_REDIRECT_URI_MISSING,
+    ERROR_ENV_INVALID_BOOL,
     ERROR_ENV_INVALID_INT,
     ERROR_ENV_INVALID_FLOAT,
+    ERROR_ENV_OUT_OF_RANGE,
 )
 
 class EnvValidationError(ValueError):
@@ -31,11 +34,17 @@ def _get_env_str(name: str) -> Optional[str]:
     s = str(val).strip()
     return s if s else None
 
-def _get_env_bool(name: str, default: bool) -> bool:
+def _get_env_bool(name: str, default: bool, *, errors: list[str]) -> bool:
     val = _get_env_str(name)
     if val is None:
         return default
-    return val.lower() == "true"
+    low = val.lower()
+    if low in ("1", "true", "yes", "on"):
+        return True
+    if low in ("0", "false", "no", "off"):
+        return False
+    errors.append(ERROR_ENV_INVALID_BOOL.format(name))
+    return default
 
 def _get_env_int(name: str, *, errors: list[str], default: Optional[int] = None) -> Optional[int]:
     val = _get_env_str(name)
@@ -44,7 +53,7 @@ def _get_env_int(name: str, *, errors: list[str], default: Optional[int] = None)
     try:
         return int(val)
     except (TypeError, ValueError):
-        errors.append(ERROR_ENV_INVALID_INT.format(name, val))
+        errors.append(ERROR_ENV_INVALID_INT.format(name, "***"))
         return default
 
 def _get_env_float(name: str, *, errors: list[str], default: Optional[float] = None) -> Optional[float]:
@@ -54,7 +63,7 @@ def _get_env_float(name: str, *, errors: list[str], default: Optional[float] = N
     try:
         return float(val)
     except (TypeError, ValueError):
-        errors.append(ERROR_ENV_INVALID_FLOAT.format(name, val))
+        errors.append(ERROR_ENV_INVALID_FLOAT.format(name, "***"))
         return default
 
 def _require_env_str(name: str, missing_msg: str, *, errors: list[str]) -> str:
@@ -64,16 +73,38 @@ def _require_env_str(name: str, missing_msg: str, *, errors: list[str]) -> str:
         return ""
     return v
 
-def _require_env_int(name: str, missing_msg: str, *, errors: list[str]) -> int:
+def _require_env_int(
+    name: str,
+    missing_msg: str,
+    *,
+    errors: list[str],
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
     v = _get_env_str(name)
     if v is None:
         errors.append(missing_msg)
         return 0
     try:
-        return int(v)
+        parsed = int(v)
     except (TypeError, ValueError):
-        errors.append(ERROR_ENV_INVALID_INT.format(name, v))
+        errors.append(ERROR_ENV_INVALID_INT.format(name, "***"))
         return 0
+    if minimum is not None and maximum is not None and not (minimum <= parsed <= maximum):
+        errors.append(ERROR_ENV_OUT_OF_RANGE.format(name, minimum, maximum))
+    return parsed
+
+def _check_int_range(name: str, value: Optional[int], minimum: int, maximum: int, *, errors: list[str]) -> None:
+    if value is None:
+        return
+    if not (minimum <= value <= maximum):
+        errors.append(ERROR_ENV_OUT_OF_RANGE.format(name, minimum, maximum))
+
+def _check_float_range(name: str, value: Optional[float], minimum: float, maximum: float, *, errors: list[str]) -> None:
+    if value is None:
+        return
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        errors.append(ERROR_ENV_OUT_OF_RANGE.format(name, minimum, maximum))
 
 @dataclass(frozen=True)
 class Settings:
@@ -84,7 +115,6 @@ class Settings:
     tg_channel_id: int
     tg_media_message_id: int
     tg_text_message_id: int
-    tg_auto_delete_messages: bool
 
     spotify_client_id: str
     spotify_client_secret: str
@@ -110,17 +140,47 @@ class Settings:
     def from_env(cls) -> "Settings":
         errors: list[str] = []
 
-        tg_api_id = _require_env_int("TG_API_ID", ERROR_AUTH_TG_API_ID_MISSING, errors=errors)
+        tg_api_id = _require_env_int(
+            "TG_API_ID",
+            ERROR_AUTH_TG_API_ID_MISSING,
+            errors=errors,
+            minimum=1,
+            maximum=2147483647,
+        )
         tg_api_hash = _require_env_str("TG_API_HASH", ERROR_AUTH_TG_API_HASH_MISSING, errors=errors)
         tg_bot_token = _require_env_str("TG_BOT_TOKEN", ERROR_AUTH_TG_BOT_TOKEN_MISSING, errors=errors)
-        tg_admin_user_id = _require_env_int("TG_ADMIN_USER_ID", ERROR_AUTH_TG_ADMIN_USER_ID_MISSING, errors=errors)
-        tg_channel_id = _require_env_int("TG_CHANNEL_ID", ERROR_AUTH_TG_CHANNEL_ID_MISSING, errors=errors)
-        tg_media_message_id = _require_env_int("TG_MEDIA_MESSAGE_ID", ERROR_AUTH_TG_MEDIA_MESSAGE_ID_MISSING, errors=errors)
-        tg_text_message_id = _require_env_int("TG_TEXT_MESSAGE_ID", ERROR_AUTH_TG_TEXT_MESSAGE_ID_MISSING, errors=errors)
+        tg_admin_user_id = _require_env_int(
+            "TG_ADMIN_USER_ID",
+            ERROR_AUTH_TG_ADMIN_USER_ID_MISSING,
+            errors=errors,
+            minimum=1,
+            maximum=9223372036854775807,
+        )
+        tg_channel_id = _require_env_int(
+            "TG_CHANNEL_ID",
+            ERROR_AUTH_TG_CHANNEL_ID_MISSING,
+            errors=errors,
+            minimum=-9223372036854775808,
+            maximum=9223372036854775807,
+        )
+        tg_media_message_id = _require_env_int(
+            "TG_MEDIA_MESSAGE_ID",
+            ERROR_AUTH_TG_MEDIA_MESSAGE_ID_MISSING,
+            errors=errors,
+            minimum=1,
+            maximum=2147483647,
+        )
+        tg_text_message_id = _require_env_int(
+            "TG_TEXT_MESSAGE_ID",
+            ERROR_AUTH_TG_TEXT_MESSAGE_ID_MISSING,
+            errors=errors,
+            minimum=1,
+            maximum=2147483647,
+        )
 
-        tg_auto_delete_messages = _get_env_bool("TG_AUTO_DELETE_MESSAGES", True)
         update_interval_raw = _get_env_int("UPDATE_INTERVAL", errors=errors, default=1)
         update_interval = update_interval_raw if update_interval_raw is not None else 1
+        _check_int_range("UPDATE_INTERVAL", update_interval, 1, 3600, errors=errors)
 
         spotify_client_id = _require_env_str("SPOTIFY_CLIENT_ID", ERROR_AUTH_SPOTIFY_CLIENT_ID_MISSING, errors=errors)
         spotify_client_secret = _require_env_str("SPOTIFY_CLIENT_SECRET", ERROR_AUTH_SPOTIFY_CLIENT_SECRET_MISSING, errors=errors)
@@ -128,26 +188,25 @@ class Settings:
         spotify_language = _get_env_str("SPOTIFY_LANGUAGE") or "EN"
         spotify_request_timeout_raw = _get_env_float("SPOTIFY_REQUEST_TIMEOUT", errors=errors, default=5.0)
         spotify_request_timeout = spotify_request_timeout_raw if spotify_request_timeout_raw is not None else 5.0
+        _check_float_range("SPOTIFY_REQUEST_TIMEOUT", spotify_request_timeout, 0.1, 300.0, errors=errors)
 
         genius_access_token = _get_env_str("GENIUS_ACCESS_TOKEN")
-        enable_genius = _get_env_bool("ENABLE_GENIUS", True)
-        genius_detailed_log = _get_env_bool("GENIUS_DETAILED_LOG", True)
+        enable_genius = _get_env_bool("ENABLE_GENIUS", True, errors=errors)
+        genius_detailed_log = _get_env_bool("GENIUS_DETAILED_LOG", True, errors=errors)
 
         mistral_api_key = _get_env_str("MISTRAL_API_KEY")
-        enable_mistral = _get_env_bool("ENABLE_MISTRAL", True)
-        mistral_model = _get_env_str("MISTRAL_MODEL") or "mistral-large-latest"
+        enable_mistral = _get_env_bool("ENABLE_MISTRAL", True, errors=errors)
+        mistral_model = _get_env_str("MISTRAL_MODEL") or "codestral-latest"
 
         auth_max_retries_raw = _get_env_int("AUTH_RETRY_MAX_RETRIES", errors=errors, default=2)
         auth_max_retries = auth_max_retries_raw if auth_max_retries_raw is not None else 2
-        if auth_max_retries < 0:
-            auth_max_retries = 0
+        _check_int_range("AUTH_RETRY_MAX_RETRIES", auth_max_retries, 0, 10, errors=errors)
 
         auth_retry_delay_base_raw = _get_env_float("AUTH_RETRY_DELAY_BASE", errors=errors, default=1.0)
         auth_retry_delay_base = auth_retry_delay_base_raw if auth_retry_delay_base_raw is not None else 1.0
-        if auth_retry_delay_base < 0:
-            auth_retry_delay_base = 0.0
+        _check_float_range("AUTH_RETRY_DELAY_BASE", auth_retry_delay_base, 0.0, 60.0, errors=errors)
 
-        enable_dep_updates = _get_env_bool("ENABLE_DEP_UPDATES", True)
+        enable_dep_updates = _get_env_bool("ENABLE_DEP_UPDATES", False, errors=errors)
 
         if errors:
             raise EnvValidationError(errors)
@@ -160,7 +219,6 @@ class Settings:
             tg_channel_id=tg_channel_id,
             tg_media_message_id=tg_media_message_id,
             tg_text_message_id=tg_text_message_id,
-            tg_auto_delete_messages=tg_auto_delete_messages,
             spotify_client_id=spotify_client_id,
             spotify_client_secret=spotify_client_secret,
             spotify_redirect_uri=spotify_redirect_uri,

@@ -6,7 +6,8 @@ from typing import Any, Optional
 
 import aiohttp
 
-from constants import MISTRAL_TIMEOUT_SECONDS
+from constants import ERROR_UNEXPECTED, MISTRAL_TIMEOUT_SECONDS
+from logger import _safe_log_warning
 from utils.http_session import init_session
 
 try:
@@ -39,10 +40,12 @@ async def close_mistral_client_unlocked() -> None:
         return
     try:
         await client.__aexit__(None, None, None)
-    except (RuntimeError, OSError, asyncio.CancelledError, AttributeError, TypeError, ValueError):
-        pass
-    except Exception:
-        pass
+    except asyncio.CancelledError:
+        raise
+    except (RuntimeError, OSError, AttributeError, TypeError, ValueError) as e:
+        _safe_log_warning(ERROR_UNEXPECTED, e)
+    except Exception as e:
+        _safe_log_warning(ERROR_UNEXPECTED, e)
 
 async def get_or_create_mistral_client(api_key: str) -> Optional[Any]:
     global _mistral_client, _mistral_client_api_key
@@ -56,7 +59,8 @@ async def get_or_create_mistral_client(api_key: str) -> Optional[Any]:
             await close_mistral_client_unlocked()
         try:
             _mistral_client = MistralClient(api_key=api_key)
-        except (TypeError, ValueError, RuntimeError):
+        except (TypeError, ValueError, RuntimeError) as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e)
             _mistral_client = None
             _mistral_client_api_key = None
             return None
@@ -73,10 +77,12 @@ async def prefetch_mistral_client(api_key: Optional[str]) -> None:
         return
     try:
         await get_or_create_mistral_client(api_key)
-    except (RuntimeError, OSError, asyncio.CancelledError, ValueError, TypeError):
-        return
-    except Exception:
-        return
+    except asyncio.CancelledError:
+        raise
+    except (RuntimeError, OSError, ValueError, TypeError) as e:
+        _safe_log_warning(ERROR_UNEXPECTED, e)
+    except Exception as e:
+        _safe_log_warning(ERROR_UNEXPECTED, e)
 
 async def complete_mistral_chat(api_key: str, chat_kwargs: dict[str, Any], timeout_seconds: float) -> Optional[Any]:
     mc = await get_or_create_mistral_client(api_key)

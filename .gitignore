@@ -35,9 +35,12 @@ session/spotify/*
 *.session-journal
 
 # IDE/editor
+.agents/
 .vscode/
 .idea/
 
 # OS files
 .DS_Store
 Thumbs.db
+
+AGENTS.md

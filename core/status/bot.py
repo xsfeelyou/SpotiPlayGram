@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from logger import _safe_log_info, _safe_log_error, _normalize_log_arg
+from logger import _safe_log_info, _safe_log_error, _safe_log_warning, _normalize_log_arg
 from constants import (
     ACCESS_DENIED_MESSAGE,
     BTN_BACK,
@@ -31,16 +31,20 @@ from constants import (
     ERROR_MISTRAL_FETCH_MODELS,
     ERROR_MISTRAL_MODEL_FORMAT,
     ERROR_MISTRAL_MODEL_INVALID,
+    ERROR_MISTRAL_MODEL_SAVE,
     ERROR_PATTERNS_ALREADY_EXIST,
     ERROR_PATTERNS_DUPLICATES,
     ERROR_PATTERNS_EMPTY,
     ERROR_PATTERNS_EXISTS_IN_FEAT,
     ERROR_PATTERNS_EXISTS_IN_TAG,
     ERROR_PATTERNS_NOT_FOUND,
+    ERROR_PATTERNS_SAVE,
+    ERROR_STATUS_DISABLE_FAILED,
     ERROR_TG_DISCONNECTED_RETRY,
     ERROR_UPDATE_LOOP,
-    INFO_AUTO_DELETE_DISABLED,
-    INFO_AUTO_DELETE_ENABLED,
+    ERROR_UNEXPECTED,
+    INFO_AUTOSTART_DISABLE_DONE,
+    INFO_AUTOSTART_ENABLE_DONE,
     INFO_BUTTON_DISABLE_PRESSED,
     INFO_BUTTON_ENABLE_PRESSED,
     INFO_DEP_UPDATES_DISABLED,
@@ -48,8 +52,7 @@ from constants import (
     INFO_GENIUS_SETTINGS_MENU,
     INFO_GENIUS_SETTINGS_MENU_NO_MISTRAL,
     INFO_MAIN_MENU,
-    INFO_MESSAGE_AUTO_DELETED,
-    INFO_MESSAGE_DELETED,
+    INFO_MESSAGES_DELETED,
     INFO_MISTRAL_CURRENT_MODEL,
     INFO_MISTRAL_ENTER_MODEL,
     INFO_MISTRAL_FALLBACK_MODELS,
@@ -81,6 +84,7 @@ from constants import (
     REASON_EMPTY_TELEGRAM_RESPONSE,
     VALUE_NOT_SET,
 )
+from utils.autostart import is_autostart_enabled, repair_autostart
 from utils.http_session import init_session
 from utils.telethon_utils import safe_call_telethon
 from lyrics.mistral_ai import (
@@ -91,7 +95,7 @@ from lyrics.mistral_ai import (
     _format_model_spec,
     is_model_reasoning_mode_valid,
 )
-from lyrics.mistral_models import fetch_mistral_models_ids
+from lyrics.mistral_models import fetch_mistral_models_ids, is_mistral_models_cached
 from config import Settings
 
 _settings: Optional[Settings] = None
@@ -122,7 +126,7 @@ async def _edit_or_respond(message, event, text: str, *, parse_mode: Optional[st
 @dataclass
 class BotState:
     status_enabled: bool = True
-    auto_delete_enabled: bool = False
+    bot_id: Optional[int] = None
     manual_disable_in_progress: bool = False
     first_enable_log_needed: bool = False
     control_message_event: Optional[Any] = None
@@ -193,6 +197,22 @@ def _cancel_update_task(state: BotState) -> None:
         except RuntimeError:
             pass
 
+async def _stop_update_task(state: BotState) -> None:
+    task = getattr(state, "update_task", None)
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        _safe_log_error(ERROR_UPDATE_LOOP, e)
+    finally:
+        if state.update_task is task:
+            state.update_task = None
+
 def _cancel_cleanup_task(state: BotState) -> None:
     task = getattr(state, "cleanup_task", None)
     state.cleanup_requested = False
@@ -234,9 +254,7 @@ async def delete_all_messages(user_client, channel_id):
     if deleted is None:
         _safe_log_error(ERROR_MESSAGE_DELETE, REASON_EMPTY_TELEGRAM_RESPONSE)
         return
-    for mid in ids_to_delete:
-        _safe_log_info(INFO_MESSAGE_DELETED, mid)
-    return
+    _safe_log_info(INFO_MESSAGES_DELETED, len(ids_to_delete))
 
 async def _run_serial_channel_cleanup(state: BotState, user_client, channel_id: int) -> None:
     try:
@@ -246,8 +264,10 @@ async def _run_serial_channel_cleanup(state: BotState, user_client, channel_id: 
                 await delete_all_messages(user_client, channel_id)
             except asyncio.CancelledError:
                 raise
-            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, aiohttp.ClientError, RuntimeError, ValueError, TypeError):
-                pass
+            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, aiohttp.ClientError, RuntimeError, ValueError, TypeError) as e:
+                _safe_log_error(ERROR_MESSAGE_DELETE, e)
+            except Exception as e:
+                _safe_log_error(ERROR_MESSAGE_DELETE, e)
     finally:
         if state.cleanup_task is asyncio.current_task():
             state.cleanup_task = None
@@ -302,7 +322,7 @@ async def _apply_default_state(
         return False
 
     try:
-        write_track_info(None)
+        await asyncio.to_thread(write_track_info, None)
     except (OSError, ValueError, TypeError):
         if suppress_errors:
             return False
@@ -315,16 +335,26 @@ async def setup_bot_commands(bot, user):
     from .spotify_status import write_track_info, update_messages, update_channel_info
     try:
         from lyrics.patterns.base import add_patterns, remove_patterns, pattern_exists, _normalize_item
-    except ImportError:
+    except ImportError as e:
+        _safe_log_error(ERROR_UNEXPECTED, e)
         add_patterns = None
         remove_patterns = None
         pattern_exists = None
         _normalize_item = None
-    state.auto_delete_enabled = st.tg_auto_delete_messages
-    if state.auto_delete_enabled:
-        _safe_log_info(INFO_AUTO_DELETE_ENABLED)
+    try:
+        me = await bot.get_me()
+        state.bot_id = getattr(me, "id", None)
+    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError) as e:
+        state.bot_id = None
+        _safe_log_error(ERROR_UNEXPECTED, e)
+    try:
+        await asyncio.to_thread(repair_autostart)
+    except (OSError, RuntimeError, ValueError, TypeError) as e:
+        _safe_log_error(ERROR_UNEXPECTED, e)
+    if await asyncio.to_thread(is_autostart_enabled):
+        _safe_log_info(INFO_AUTOSTART_ENABLE_DONE)
     else:
-        _safe_log_info(INFO_AUTO_DELETE_DISABLED)
+        _safe_log_info(INFO_AUTOSTART_DISABLE_DONE)
     if st.enable_dep_updates:
         _safe_log_info(INFO_DEP_UPDATES_ENABLED)
     else:
@@ -333,34 +363,33 @@ async def setup_bot_commands(bot, user):
     if api_key and st.enable_mistral:
         try:
             await ensure_selected_models_cached(api_key)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError, ValueError):
-            pass
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError, ValueError) as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e)
 
     @user.on(events.NewMessage(chats=st.tg_channel_id))
     async def auto_delete_handler(event):
-        if not state.auto_delete_enabled:
-            return
-
         keep_message_ids = [1, st.tg_media_message_id, st.tg_text_message_id]
 
         if event.id not in keep_message_ids:
             try:
                 await event.delete()
-                _safe_log_info(INFO_MESSAGE_AUTO_DELETED, event.id)
             except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                 _safe_log_error(ERROR_MESSAGE_DELETE, e)
 
     @bot.on(events.NewMessage(pattern="/start"))
     async def start_handler(event):
-        sender = await event.get_sender()
+        try:
+            sender = await event.get_sender()
+        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
+            sender = None
         admin_user_id = st.tg_admin_user_id
 
-        if sender.id == admin_user_id:
+        if sender is not None and sender.id == admin_user_id:
             await send_main_menu(event, bot)
         else:
             await event.respond(ACCESS_DENIED_MESSAGE)
 
-    async def show_mistral_menu(event):
+    async def show_mistral_menu(event, force_refresh: bool = False):
         if not bool(st.enable_mistral and _mistral_api_key_valid):
             state.set_menu("genius")
             await show_genius_settings_menu(event)
@@ -378,12 +407,14 @@ async def setup_bot_commands(bot, user):
                 Button.text(INFO_MAIN_MENU, resize=True),
             ]]
             chat = await event.get_input_chat()
-            loading_msg = await bot.send_message(chat, INFO_MISTRAL_LOADING, buttons=menu_buttons)
+            loading_msg = None
+            if force_refresh or not is_mistral_models_cached(st.mistral_api_key):
+                loading_msg = await bot.send_message(chat, INFO_MISTRAL_LOADING, buttons=menu_buttons)
 
-            ids, details_text, err = await fetch_mistral_models_ids(st.mistral_api_key)
+            ids, details_text, err = await fetch_mistral_models_ids(st.mistral_api_key, force_refresh=force_refresh)
             models_text = details_text or ""
             if err:
-                models_text = ERROR_MISTRAL_FETCH_MODELS.format(err)
+                models_text = ERROR_MISTRAL_FETCH_MODELS.format(html.escape(str(err)))
             current_model = read_mistral_model()
             _models_list = [_format_model_spec(model, mode) for model, mode in _split_model_specs(current_model)]
             if not _models_list and st.mistral_model:
@@ -481,7 +512,7 @@ async def setup_bot_commands(bot, user):
             buttons=buttons,
         )
 
-    @bot.on(events.NewMessage)
+    @bot.on(events.NewMessage(from_users=st.tg_admin_user_id, incoming=True))
     async def main_menu_router(event):
         state = _state
         try:
@@ -499,7 +530,7 @@ async def setup_bot_commands(bot, user):
             if text == BTN_REFRESH_MISTRAL:
                 if state.current_menu == "mistral" and state.mistral_refresh_enabled and not state.mistral_busy:
                     state.awaiting_mistral_model_input = True
-                    await show_mistral_menu(event)
+                    await show_mistral_menu(event, force_refresh=True)
                 return
             if text == BTN_BACK:
                 if state.current_menu == "patterns" and state.patterns_kind in ("tag", "feat") and (state.awaiting_patterns_input or state.awaiting_patterns_confirm):
@@ -599,12 +630,25 @@ async def setup_bot_commands(bot, user):
                         return
 
                     try:
-                        if state.patterns_action == "add" and callable(add_patterns):
-                            _ = add_patterns(state.patterns_kind, pending)
-                        elif state.patterns_action == "delete" and callable(remove_patterns):
-                            _ = remove_patterns(state.patterns_kind, pending)
-                    except (OSError, ValueError, TypeError):
-                        pass
+                        if state.patterns_action == "add":
+                            if not callable(add_patterns):
+                                raise RuntimeError("patterns module is unavailable")
+                            add_patterns(state.patterns_kind, pending)
+                        elif state.patterns_action == "delete":
+                            if not callable(remove_patterns):
+                                raise RuntimeError("patterns module is unavailable")
+                            remove_patterns(state.patterns_kind, pending)
+                        _safe_log_info(
+                            INFO_PATTERNS_APPLIED,
+                            f"admin {event.sender_id} {state.patterns_action} {state.patterns_kind}: {', '.join(pending)}",
+                        )
+                    except (OSError, ValueError, TypeError, RuntimeError) as e:
+                        _safe_log_error(ERROR_UNEXPECTED, e)
+                        await event.respond(
+                            ERROR_PATTERNS_SAVE,
+                            buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]],
+                        )
+                        return
 
                     state.awaiting_patterns_confirm = False
                     state.awaiting_patterns_input = False
@@ -629,7 +673,7 @@ async def setup_bot_commands(bot, user):
                         return
                     state.enable_in_progress = True
                     _safe_log_info(INFO_BUTTON_ENABLE_PRESSED)
-                    _cancel_update_task(state)
+                    await _stop_update_task(state)
                     state.status_enabled = True
                     state.first_enable_log_needed = True
                     try:
@@ -646,7 +690,7 @@ async def setup_bot_commands(bot, user):
                         return
                     state.disable_in_progress = True
                     _safe_log_info(INFO_BUTTON_DISABLE_PRESSED)
-                    _cancel_update_task(state)
+                    await _stop_update_task(state)
                     state.status_enabled = False
                     state.manual_disable_in_progress = True
                     state.control_message_event = None
@@ -667,10 +711,22 @@ async def setup_bot_commands(bot, user):
                                 update_channel_info=update_channel_info,
                                 suppress_errors=True,
                             )
-                            if default_applied:
-                                _schedule_channel_cleanup(state, user, st.tg_channel_id)
-                        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError):
-                            pass
+                        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError) as e:
+                            _safe_log_error(ERROR_UPDATE_LOOP, e)
+                            default_applied = False
+                        if not default_applied:
+                            state.status_enabled = True
+                            state.first_enable_log_needed = False
+                            _safe_log_error(ERROR_STATUS_DISABLE_FAILED)
+                            try:
+                                await event.respond(
+                                    ERROR_STATUS_DISABLE_FAILED,
+                                    buttons=[[Button.text(BTN_ENABLE, resize=True)], [Button.text(BTN_BACK, resize=True)]]
+                                )
+                            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError):
+                                pass
+                            return
+                        _schedule_channel_cleanup(state, user, st.tg_channel_id)
 
                         try:
                             await event.respond(
@@ -861,12 +917,15 @@ async def setup_bot_commands(bot, user):
 
                 new_model_value = ", ".join(normalized)
                 try:
-                    _ = write_mistral_model(new_model_value)
+                    saved = write_mistral_model(new_model_value)
                 except (OSError, ValueError, TypeError) as e:
+                    _safe_log_error(ERROR_UNEXPECTED, e)
+                    saved = False
+                if not saved:
                     await _edit_or_respond(
                         saving_msg,
                         event,
-                        ERROR_MISTRAL_FETCH_MODELS.format(_normalize_log_arg(e)),
+                        ERROR_MISTRAL_MODEL_SAVE,
                         buttons=[[Button.text(BTN_BACK, resize=True), Button.text(INFO_MAIN_MENU, resize=True)]],
                     )
                     return
@@ -884,8 +943,8 @@ async def setup_bot_commands(bot, user):
                 await show_mistral_menu(event)
                 return
 
-        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, aiohttp.ClientError, RuntimeError, ValueError, TypeError):
-            pass
+        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, aiohttp.ClientError, RuntimeError, ValueError, TypeError) as e:
+            _safe_log_error(ERROR_UPDATE_LOOP, e)
         finally:
             state.mistral_busy = False
 
@@ -907,7 +966,8 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
     from .spotify_status import update_channel, update_messages, update_channel_info, read_track_info, write_track_info
     try:
         from lyrics.patterns import base as patterns_base
-    except ImportError:
+    except ImportError as e:
+        _safe_log_error(ERROR_UNEXPECTED, e)
         patterns_base = None
     apply_pending_reload = getattr(patterns_base, "apply_pending_reload", None) if patterns_base is not None else None
     state = _state
@@ -918,9 +978,10 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
         if callable(is_conn):
             try:
                 return bool(is_conn())
-            except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
-                return True
-        return True
+            except (AttributeError, TypeError, ValueError, RuntimeError, OSError) as e:
+                _safe_log_warning(ERROR_UNEXPECTED, e)
+                return False
+        return False
 
     async def _ensure_tg_connected(*, force: bool = False) -> tuple[bool, int]:
         now = time.monotonic()
@@ -937,7 +998,7 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                 return True, 0
             return False, 0
 
-        if user_ok and bot_ok and not force:
+        if user_ok and bot_ok:
             if state.tg_was_disconnected:
                 state.tg_was_disconnected = False
                 state.tg_backoff_seconds = 0
@@ -959,13 +1020,13 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
             try:
                 if not _is_connected(user_client):
                     await user_client.connect()
-            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError):
-                pass
+            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError) as e:
+                _safe_log_warning(ERROR_UNEXPECTED, e)
             try:
                 if not _is_connected(bot_client):
                     await bot_client.connect()
-            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError):
-                pass
+            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError) as e:
+                _safe_log_warning(ERROR_UNEXPECTED, e)
 
             if _is_connected(user_client) and _is_connected(bot_client):
                 state.tg_was_disconnected = False
@@ -1036,6 +1097,9 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                     if not ok:
                         await asyncio.sleep(max(sleep_seconds, retry_in))
                         continue
+                    if not state.status_enabled or state.manual_disable_in_progress:
+                        await asyncio.sleep(sleep_seconds)
+                        continue
                     task = asyncio.create_task(update_channel(bot_client, spotify_client))
                     state.update_task = task
                     try:
@@ -1049,12 +1113,12 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                             state.update_task = None
                     wrote = False
                     if state.status_enabled:
-                        wrote = write_track_info(track_id_result)
+                        wrote = await asyncio.to_thread(write_track_info, track_id_result)
                     if wrote:
                         _schedule_channel_cleanup(state, user_client, st.tg_channel_id)
                         try:
                             if callable(apply_pending_reload):
-                                feat_applied, tag_applied = apply_pending_reload()
+                                feat_applied, tag_applied = await asyncio.to_thread(apply_pending_reload)
                                 if feat_applied or tag_applied:
                                     parts = []
                                     if tag_applied:
@@ -1063,8 +1127,8 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                                         parts.append(PATTERNS_KIND_FEAT_LABEL)
                                     short = ", ".join(parts) if parts else PATTERNS_KIND_GENERIC_LABEL
                                     _safe_log_info(INFO_PATTERNS_APPLIED, short)
-                        except (OSError, ValueError, TypeError):
-                            pass
+                        except (OSError, ValueError, TypeError) as e:
+                            _safe_log_warning(ERROR_UNEXPECTED, e)
                     if state.first_enable_log_needed:
                         _safe_log_info(INFO_STATUS_ENABLED)
                         state.first_enable_log_needed = False
@@ -1084,7 +1148,9 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                                     pass
                             state.control_message_event = None
                         state.enable_in_progress = False
-            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, aiohttp.ClientError, RuntimeError, ValueError, TypeError) as e:
+            except Exception as e:
+                state.enable_in_progress = False
+                state.disable_in_progress = False
                 now = time.monotonic()
                 try:
                     err_text = str(e)
@@ -1104,4 +1170,4 @@ async def patched_update_channel(user_client, bot_client, spotify_client):
                     pass
             await asyncio.sleep(sleep_seconds)
     except asyncio.CancelledError:
-        return
+        raise

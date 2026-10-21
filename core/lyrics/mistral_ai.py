@@ -16,12 +16,13 @@ from constants import (
     ERROR_MISTRAL_REQUEST,
     ERROR_MISTRAL_SDK_MISSING,
     ERROR_MISTRAL_TIMEOUT,
+    ERROR_UNEXPECTED,
     INFO_MISTRAL_FINAL_SELECTION_START,
     INFO_MISTRAL_MODEL_UPDATED,
     INFO_MISTRAL_SWITCH_MODEL,
     MISTRAL_TIMEOUT_SECONDS,
 )
-from logger import _safe_log_info, _safe_log_error
+from logger import _safe_log_info, _safe_log_error, _safe_log_warning, dev_logger
 from utils.mistral_client import (
     complete_mistral_chat,
     get_mistral_client_class,
@@ -313,6 +314,8 @@ def _write_mistral_log(
     reasoning_effort: Optional[str] = None,
     prompt_mode: Optional[str] = None,
 ) -> None:
+    if not _is_genius_detailed_log():
+        return
     lines: List[str] = []
     lines.append("=" * 80)
     lines.append("GENIUS MISTRAL FINAL SELECTION LOG")
@@ -389,10 +392,11 @@ def write_mistral_model(new_model: str) -> bool:
     cur_list = _split_model_spec_strings(cur_val)
 
     if new_list == cur_list:
-        return False
+        return True
 
     cache["selected_models"] = new_list
-    _write_models_cache(cache)
+    if not _write_models_cache(cache):
+        return False
     _safe_log_info(INFO_MISTRAL_MODEL_UPDATED, ", ".join(new_list))
     return True
 
@@ -438,7 +442,7 @@ def _read_models_cache() -> Dict[str, Any]:
         _models_cache_mem_mtime = mtime
     return copy.deepcopy(_models_cache_mem)
 
-def _write_models_cache(data: Dict[str, Any]) -> None:
+def _write_models_cache(data: Dict[str, Any]) -> bool:
     global _models_cache_mem, _models_cache_mem_mtime
     try:
         parent = os.path.dirname(_MISTRAL_MODELS_CACHE_PATH)
@@ -448,14 +452,16 @@ def _write_models_cache(data: Dict[str, Any]) -> None:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, _MISTRAL_MODELS_CACHE_PATH)
-    except OSError:
-        return
+    except OSError as e:
+        _safe_log_error(ERROR_UNEXPECTED, e, logger=dev_logger)
+        return False
     try:
         _models_cache_mem = copy.deepcopy(data) if isinstance(data, dict) else None
         _models_cache_mem_mtime = os.path.getmtime(_MISTRAL_MODELS_CACHE_PATH)
     except OSError:
         _models_cache_mem = None
         _models_cache_mem_mtime = None
+    return True
 
 def _coerce_to_text(value: Any) -> str:
     if value is None:
@@ -574,7 +580,7 @@ def _extract_mistral_content_text(resp: Any) -> str:
         msg = getattr(choices[0], "message", None)
         raw = getattr(msg, "content", None) if msg is not None else None
     if raw is None:
-        raw = resp
+        return ""
     return _coerce_to_text(raw).strip()
 
 def _format_mistral_error_message(value: Any, max_len: int = 160) -> str:
@@ -619,6 +625,10 @@ def _parse_mistral_idx(out_text: str) -> tuple[Optional[int], bool, Optional[str
     if not isinstance(parsed, dict):
         return None, False, "invalid content: root is not object"
     idx_val = parsed.get("idx")
+    if isinstance(idx_val, int) and not isinstance(idx_val, bool):
+        if idx_val <= 0:
+            return None, False, "invalid content: idx must be >= 1"
+        return idx_val, False, None
     if not isinstance(idx_val, str) or not idx_val.strip():
         return None, False, "invalid content: idx is missing or not string"
     idx_str = idx_val.strip()
@@ -722,6 +732,7 @@ async def check_model_reasoning_capabilities(
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "Content-Type": "application/json"}
     efforts: List[str] = []
     default_has_thinking = False
+    prompt_mode_reasoning = False
     effort_candidates: List[str] = []
     seen_effort_candidates = set()
     raw_effort_candidates: List[str] = list(known_efforts or [])
@@ -732,72 +743,64 @@ async def check_model_reasoning_capabilities(
         if effort and effort not in seen_effort_candidates:
             seen_effort_candidates.add(effort)
             effort_candidates.append(effort)
-    for effort in effort_candidates:
-        payload = {
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": "Return only a JSON object."},
-                {"role": "user", "content": "Return {\"ok\":\"yes\"}."},
-            ],
-            "max_tokens": _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS,
-            "temperature": 0,
-            "reasoning_effort": effort,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "reasoning_probe",
-                    "schema": _MISTRAL_REASONING_PROBE_JSON_SCHEMA,
-                },
+    base_payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": "Return only a JSON object."},
+            {"role": "user", "content": "Return {\"ok\":\"yes\"}."},
+        ],
+        "max_tokens": _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS,
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "reasoning_probe",
+                "schema": _MISTRAL_REASONING_PROBE_JSON_SCHEMA,
             },
-        }
+        },
+    }
+
+    async def probe_effort(effort: str) -> Optional[str]:
+        payload = dict(base_payload)
+        payload["reasoning_effort"] = effort
         ok, out_text, _ = await _probe_mistral_chat_payload(headers, payload, timeout_seconds, max_retries)
         if ok and _is_probe_json_valid(out_text):
-            efforts.append(effort)
-    has_active_reasoning_effort = any(effort != "none" for effort in efforts)
-    if known_reasoning is not False:
-        payload = {
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": "Return only a JSON object."},
-                {"role": "user", "content": "Return {\"ok\":\"yes\"}."},
-            ],
-            "max_tokens": _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS,
-            "temperature": 0,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "reasoning_probe",
-                    "schema": _MISTRAL_REASONING_PROBE_JSON_SCHEMA,
-                },
-            },
-        }
-        ok, out_text, has_thinking = await _probe_mistral_chat_payload(headers, payload, timeout_seconds, max_retries)
-        default_has_thinking = bool(ok and _is_probe_json_valid(out_text) and has_thinking)
-    prompt_mode_reasoning = False
-    if not has_active_reasoning_effort and not default_has_thinking and known_reasoning is not False:
-        payload = {
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": "Return only a JSON object."},
-                {"role": "user", "content": "Return {\"ok\":\"yes\"}."},
-            ],
-            "max_tokens": _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS,
-            "temperature": 0,
-            "prompt_mode": "reasoning",
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "reasoning_probe",
-                    "schema": _MISTRAL_REASONING_PROBE_JSON_SCHEMA,
-                },
-            },
-        }
+            return effort
+        return None
+
+    async def probe_default() -> bool:
+        ok, out_text, has_thinking = await _probe_mistral_chat_payload(
+            headers, dict(base_payload), timeout_seconds, max_retries
+        )
+        return bool(ok and _is_probe_json_valid(out_text) and has_thinking)
+
+    async def probe_prompt_mode() -> bool:
+        payload = dict(base_payload)
+        payload["prompt_mode"] = "reasoning"
         ok, out_text, _ = await _probe_mistral_chat_payload(headers, payload, timeout_seconds, max_retries)
-        prompt_mode_reasoning = bool(ok and _is_probe_json_valid(out_text))
+        return bool(ok and _is_probe_json_valid(out_text))
+
+    if known_reasoning is not False:
+        default_has_thinking = await probe_default()
     if default_has_thinking:
-        reasoning_type = "native"
-        efforts = []
-    elif has_active_reasoning_effort:
+        return {
+            "reasoning": True,
+            "reasoning_type": "native",
+            "reasoning_efforts": [],
+            "default_has_thinking": True,
+            "prompt_mode_reasoning": False,
+        }
+    probe_results: List[Any] = []
+    if known_reasoning is not False:
+        probe_results = await asyncio.gather(
+            *(probe_effort(effort) for effort in effort_candidates),
+            probe_prompt_mode(),
+        )
+        efforts = [effort for effort in probe_results[:-1] if effort]
+    has_active_reasoning_effort = any(effort != "none" for effort in efforts)
+    if probe_results and not has_active_reasoning_effort:
+        prompt_mode_reasoning = bool(probe_results[-1])
+    if has_active_reasoning_effort:
         reasoning_type = "adjustable"
     elif known_reasoning is True:
         reasoning_type = "native"
@@ -820,6 +823,7 @@ async def update_models_cache(
     max_retries: int = 3,
     timeout_seconds: Optional[float] = None,
     concurrency: int = _MISTRAL_MODEL_CAPABILITY_CONCURRENCY,
+    partial_update: bool = False,
 ) -> Dict[str, Any]:
     full_cache = _read_models_cache()
     existing_selected = _split_model_spec_strings(full_cache.get("selected_models", []))
@@ -857,9 +861,12 @@ async def update_models_cache(
                     previous_info.get("reasoning_efforts"),
                     previous_info.get("reasoning_modes"),
                 )
+        cached_entry = cached_models.get(model_id)
+        if not isinstance(cached_entry, dict):
+            cached_entry = previous_info if isinstance(previous_info, dict) else None
         async with semaphore:
-            if model_id in cached_models and not force_recheck:
-                cached_info = dict(cached_models[model_id])
+            if cached_entry is not None and not force_recheck:
+                cached_info = dict(cached_entry)
                 cached_info["aliases"] = aliases
                 if "reasoning_efforts" not in cached_info and "reasoning_modes" in cached_info:
                     cached_info["reasoning_efforts"] = cached_info.get("reasoning_modes", [])
@@ -868,7 +875,12 @@ async def update_models_cache(
                     cached_info.get("reasoning_modes"),
                     known_efforts,
                 )
-                if "reasoning_type" not in cached_info or "prompt_mode_reasoning" not in cached_info:
+                needs_capabilities_check = (
+                    "reasoning_type" not in cached_info
+                    or "prompt_mode_reasoning" not in cached_info
+                    or (known_reasoning is True and str(cached_info.get("reasoning_type") or "") == "none")
+                )
+                if needs_capabilities_check:
                     capabilities = await check_model_reasoning_capabilities(
                         model_id,
                         api_key,
@@ -914,6 +926,10 @@ async def update_models_cache(
             continue
         model_id, model_info = result
         new_models[model_id] = model_info
+    if partial_update and not force_recheck:
+        merged_models = dict(full_cached_models)
+        merged_models.update(new_models)
+        new_models = merged_models
     if not existing_selected:
         st = get_settings()
         existing_selected = _split_model_spec_strings(st.mistral_model)
@@ -1008,7 +1024,8 @@ async def ensure_selected_models_cached(api_key: str) -> None:
         sanitized_selected = _sanitize_model_specs_with_cache(cache.get("selected_models", []), cache)
         if sanitized_selected:
             cache["selected_models"] = sanitized_selected
-        _write_models_cache(cache)
+        if not _write_models_cache(cache):
+            _safe_log_error(ERROR_UNEXPECTED, "failed to save selected models", logger=dev_logger)
 
 async def choose_genius_candidate_with_mistral(
     spotify_track_meta: Dict[str, str],
@@ -1048,8 +1065,8 @@ async def choose_genius_candidate_with_mistral(
                 return idx_inflight, explicit_none_inflight, "inflight"
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
+            except Exception as e:
+                _safe_log_error(ERROR_UNEXPECTED, e, logger=dev_logger)
 
     if payload_text is None:
         payload = {
@@ -1196,6 +1213,29 @@ async def choose_genius_candidate_with_mistral(
 
             if resp is not None:
                 out_text = _extract_mistral_content_text(resp)
+                if not out_text and current_model_type == "Non Reasoning":
+                    retry_kwargs = dict(chat_kwargs)
+                    retry_kwargs["max_tokens"] = _MISTRAL_FINAL_SELECTION_REASONING_MAX_TOKENS
+                    try:
+                        retry_resp = await complete_mistral_chat(
+                            api_key,
+                            retry_kwargs,
+                            MISTRAL_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        retry_resp = None
+                    except Exception as e:
+                        _safe_log_warning(ERROR_MISTRAL_REQUEST, _format_mistral_error_message(e), logger=dev_logger)
+                        retry_resp = None
+                    if retry_resp is not None:
+                        resp = retry_resp
+                        out_text = _extract_mistral_content_text(resp)
+                        current_model_type = "Reasoning (retry)"
+                choices = getattr(resp, "choices", None)
+                if isinstance(choices, list) and choices:
+                    finish_reason = getattr(choices[0], "finish_reason", None)
+                    if finish_reason and str(finish_reason) != "stop":
+                        _safe_log_warning(ERROR_MISTRAL_REQUEST, f"finish_reason={finish_reason}", logger=dev_logger)
                 usage = getattr(resp, "usage", None)
                 usage_data: Optional[Dict[str, int]] = None
                 if usage:
@@ -1243,30 +1283,33 @@ async def choose_genius_candidate_with_mistral(
         if task is None:
             task = asyncio.create_task(_run_selection())
             _MISTRAL_CHOICE_INFLIGHT[cache_key] = task
+
+            def _clear_choice_task(done_task, key=cache_key):
+                if _MISTRAL_CHOICE_INFLIGHT.get(key) is done_task:
+                    _MISTRAL_CHOICE_INFLIGHT.pop(key, None)
+                if not done_task.cancelled():
+                    done_task.exception()
+
+            task.add_done_callback(_clear_choice_task)
             try:
-                result = await task
+                result = await asyncio.shield(task)
             except asyncio.CancelledError:
-                try:
-                    task.cancel()
-                except RuntimeError:
-                    pass
                 raise
-            except Exception:
+            except Exception as e:
+                _safe_log_error(ERROR_UNEXPECTED, e, logger=dev_logger)
                 result = (None, False)
-            finally:
-                if _MISTRAL_CHOICE_INFLIGHT.get(cache_key) is task:
-                    _MISTRAL_CHOICE_INFLIGHT.pop(cache_key, None)
 
             if result[1] or result[0] is not None:
                 now = asyncio.get_running_loop().time()
                 _mistral_choice_cache_set(cache_key, now, result[0], result[1])
             return result[0], result[1], "fresh"
         try:
-            idx_shared, explicit_none_shared = await task
+            idx_shared, explicit_none_shared = await asyncio.shield(task)
             return idx_shared, explicit_none_shared, "inflight"
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
+            _safe_log_error(ERROR_UNEXPECTED, e, logger=dev_logger)
             return None, False, "skipped"
 
     task = asyncio.create_task(_run_selection())
@@ -1279,3 +1322,6 @@ async def choose_genius_candidate_with_mistral(
         except RuntimeError:
             pass
         raise
+    except Exception as e:
+        _safe_log_error(ERROR_UNEXPECTED, e, logger=dev_logger)
+        return None, False, "skipped"

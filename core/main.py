@@ -3,7 +3,14 @@ import sys
 import asyncio
 from subprocess import call
 
-from logger import _safe_log_info, _safe_log_error, dev_logger
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_CHDIR_ERROR = None
+try:
+    os.chdir(_PROJECT_ROOT)
+except OSError as e:
+    _CHDIR_ERROR = e
+
+from logger import _safe_log_info, _safe_log_error, _safe_log_warning, dev_logger
 
 def install_libs():
     libs = [
@@ -23,25 +30,33 @@ def install_libs():
 install_libs()
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 from telethon import TelegramClient
 from telethon.errors import RPCError
 from spotipy import SpotifyOAuth
+from spotipy.exceptions import SpotifyOauthError
 
 import logging
 logging.getLogger("telethon").setLevel(logging.ERROR)
 from constants import (
+    APP_NAME,
     DIRS,
+    ERROR_SESSION_DIR,
+    WARNING_CHDIR_FAILED,
     ERROR_AUTH_GENIUS,
     ERROR_AUTH_GENIUS_INVALID_TOKEN,
     ERROR_AUTH_MISTRAL,
     ERROR_AUTH_MISTRAL_API_KEY_MISSING,
     ERROR_AUTH_SPOTIFY,
     ERROR_AUTH_TG,
+    ENV_LOCAL_LOCK_HELD,
+    ENV_NO_PAUSE,
+    ERROR_DEVICE_LOCK,
     ERROR_GENIUS_ACCESS_TOKEN_INVALID,
     ERROR_SPOTIFY_AUTH_INVALID,
     ERROR_TG_AUTH_INVALID,
+    ERROR_UPDATE_LOOP,
     ERROR_UNEXPECTED,
     INFO_APP_SHUTDOWN,
     INFO_AUTH_GENIUS,
@@ -58,6 +73,8 @@ from constants import (
     INFO_ENTERING_MAIN_LOOP,
     INFO_GENIUS_DISABLED,
     INFO_MISTRAL_DISABLED,
+    INFO_SINGLE_INSTANCE,
+    INFO_SINGLE_INSTANCE_REMOTE,
     INFO_STARTUP_COMPLETE,
     LOG_FORMAT_GENIUS,
     LOG_FORMAT_MISTRAL,
@@ -66,25 +83,74 @@ from constants import (
 )
 from config import Settings, EnvValidationError
 
+if _CHDIR_ERROR is not None:
+    _safe_log_warning(WARNING_CHDIR_FAILED, _CHDIR_ERROR)
+
 from utils.http_session import init_session, close_session
+from utils.runtime_guard import (
+    DeviceLockBusy,
+    acquire_device_lock,
+    acquire_single_instance_lock,
+    set_console_title,
+    wait_for_enter,
+)
 from utils.mistral_client import close_mistral_client, prefetch_mistral_client
 from utils.spotify_client import AsyncSpotifyClient, get_spg_cache_handler
 from utils.update_libs import schedule_daily_update_check
 from aiohttp import ClientTimeout, ClientError
 
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+def _spawn_background_task(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+def _abs_under_root(p: str) -> str:
+    return p if os.path.isabs(p) else os.path.join(_PROJECT_ROOT, p)
+
+def _secure_dir(path: str) -> None:
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+def _secure_file(path: str) -> None:
+    if os.name == "nt":
+        return
+    try:
+        if os.path.exists(path):
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+
 def _ensure_runtime_dirs() -> None:
-    for d in DIRS.values():
+    session_failed = False
+    for name, d in DIRS.items():
+        path = _abs_under_root(d)
         try:
-            os.makedirs(d, exist_ok=True)
-        except OSError:
-            pass
+            os.makedirs(path, exist_ok=True)
+            _secure_dir(path)
+        except OSError as e:
+            _safe_log_error(ERROR_SESSION_DIR, e)
+            if name == "SESSION":
+                session_failed = True
     session_dir_raw = DIRS.get("SESSION")
     session_dir = str(session_dir_raw).strip() if session_dir_raw else "session"
+    session_dir = _abs_under_root(session_dir)
     for name in ("spotify", "genius", "mistral", "telegram"):
+        path = os.path.join(session_dir, name)
         try:
-            os.makedirs(os.path.join(session_dir, name), exist_ok=True)
-        except OSError:
-            pass
+            os.makedirs(path, exist_ok=True)
+            _secure_dir(path)
+        except OSError as e:
+            _safe_log_error(ERROR_SESSION_DIR, e)
+            session_failed = True
+    _secure_file(os.path.join(_PROJECT_ROOT, ".env"))
+    if session_failed:
+        raise RuntimeError(ERROR_SESSION_DIR.format(session_dir))
 
 def _is_telegram_auth_invalid(err: Exception) -> bool:
     try:
@@ -145,11 +211,11 @@ async def _start_telegram_client(
 ) -> TelegramClient:
     _safe_log_info(start_log)
     client = TelegramClient(
-        os.path.join(DIRS["SESSION"], "telegram", session_name),
+        os.path.join(_abs_under_root(DIRS["SESSION"]), "telegram", session_name),
         settings.tg_api_id,
         settings.tg_api_hash,
-        connection_retries=None,
-        retry_delay=1.0,
+        connection_retries=max(0, min(settings.auth_max_retries, 10)),
+        retry_delay=max(0.5, min(settings.auth_retry_delay_base, 30.0)),
         auto_reconnect=True,
     )
     max_attempts, delay_base = _get_auth_retry_settings(settings)
@@ -161,25 +227,19 @@ async def _start_telegram_client(
                 await client.start()
             _safe_log_info(success_log)
             return client
-        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError) as e:
+        except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError, EOFError) as e:
             if isinstance(e, (ConnectionError, asyncio.TimeoutError, OSError)) and attempt < max_attempts:
                 await _sleep_auth_retry(LOG_FORMAT_TELEGRAM, delay_base, attempt, max_attempts)
                 continue
-            try:
-                if _is_telegram_auth_invalid(e):
-                    _safe_log_error(ERROR_TG_AUTH_INVALID)
-                    raise
-            except (ValueError, TypeError, OSError):
-                pass
-            try:
-                _safe_log_error(ERROR_AUTH_TG)
-            except (ValueError, TypeError, OSError):
-                pass
+            if _is_telegram_auth_invalid(e):
+                _safe_log_error(ERROR_TG_AUTH_INVALID)
+            else:
+                _safe_log_error(ERROR_AUTH_TG, e)
             raise
 
 async def _start_spotify(settings: Settings) -> AsyncSpotifyClient:
     _safe_log_info(INFO_AUTH_SPOTIFY)
-    cache_path = os.path.join(DIRS["SESSION"], "spotify", ".cache")
+    cache_path = os.path.join(_abs_under_root(DIRS["SESSION"]), "spotify", ".cache")
     cache_handler = get_spg_cache_handler(cache_path)
     auth_manager = SpotifyOAuth(
         client_id=settings.spotify_client_id,
@@ -203,20 +263,14 @@ async def _start_spotify(settings: Settings) -> AsyncSpotifyClient:
                 raise ValueError("empty spotify access token")
             _safe_log_info(INFO_AUTH_SPOTIFY_SUCCESS)
             return spotify
-        except (ClientError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError) as e:
-            try:
-                if _is_spotify_auth_invalid(e):
-                    _safe_log_error(ERROR_SPOTIFY_AUTH_INVALID)
-                    raise
-            except (KeyError, IndexError, ValueError, TypeError, OSError):
-                pass
-            if attempt < max_attempts:
+        except (ClientError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError, EOFError, SpotifyOauthError) as e:
+            if _is_spotify_auth_invalid(e):
+                _safe_log_error(ERROR_SPOTIFY_AUTH_INVALID)
+                raise
+            if isinstance(e, (ClientError, ConnectionError, asyncio.TimeoutError, OSError)) and attempt < max_attempts:
                 await _sleep_auth_retry(LOG_FORMAT_SPOTIFY, delay_base, attempt, max_attempts)
                 continue
-            try:
-                _safe_log_error(ERROR_AUTH_SPOTIFY, e)
-            except (KeyError, IndexError, ValueError, TypeError, OSError):
-                pass
+            _safe_log_error(ERROR_AUTH_SPOTIFY, e)
             raise
 
 async def _check_genius_and_mistral(settings: Settings) -> bool:
@@ -321,27 +375,45 @@ async def _prefetch_runtime_state(
             prefetch_genius_runtime = getattr(genius_search_module, "prefetch_search_runtime", None)
             if callable(prefetch_genius_runtime):
                 runtime_tasks.append(asyncio.create_task(prefetch_genius_runtime()))
-        except (AttributeError, TypeError, RuntimeError, ValueError, OSError):
-            pass
+        except (AttributeError, TypeError, RuntimeError, ValueError, OSError) as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e)
 
     if settings.enable_mistral and settings.mistral_api_key:
         try:
             read_mistral_model = getattr(mistral_ai_module, "read_mistral_model", None)
             if callable(read_mistral_model):
                 read_mistral_model()
-        except (AttributeError, TypeError, RuntimeError, ValueError, OSError):
-            pass
+        except (AttributeError, TypeError, RuntimeError, ValueError, OSError) as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e)
 
         if mistral_valid:
             try:
                 runtime_tasks.append(asyncio.create_task(prefetch_mistral_client(settings.mistral_api_key)))
-            except (AttributeError, TypeError, RuntimeError, ValueError, OSError):
-                pass
+            except (AttributeError, TypeError, RuntimeError, ValueError, OSError) as e:
+                _safe_log_warning(ERROR_UNEXPECTED, e)
+            try:
+                from lyrics.mistral_models import prefetch_mistral_models_menu
+                _spawn_background_task(prefetch_mistral_models_menu(settings.mistral_api_key))
+            except (AttributeError, ImportError, TypeError, RuntimeError, ValueError, OSError) as e:
+                _safe_log_warning(ERROR_UNEXPECTED, e)
 
     if runtime_tasks:
-        await asyncio.gather(*runtime_tasks, return_exceptions=True)
+        results = await asyncio.gather(*runtime_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                _safe_log_warning(ERROR_UNEXPECTED, result)
 
 async def main():
+    set_console_title(APP_NAME)
+    _ensure_runtime_dirs()
+
+    if not os.environ.get(ENV_LOCAL_LOCK_HELD):
+        lock_path = os.path.join(_abs_under_root(DIRS["SESSION"]), ".app.lock")
+        if not acquire_single_instance_lock(lock_path):
+            _safe_log_warning(INFO_SINGLE_INSTANCE)
+            await asyncio.to_thread(wait_for_enter)
+            return
+
     try:
         settings = Settings.from_env()
     except EnvValidationError as e:
@@ -352,7 +424,7 @@ async def main():
                 pass
         raise
 
-    _ensure_runtime_dirs()
+    init_session()
 
     try:
         loop = asyncio.get_running_loop()
@@ -396,14 +468,15 @@ async def main():
     genius_search_module.set_settings(settings)
     mistral_ai_module.set_settings(settings)
 
-    init_session()
-
+    lease = None
+    lease_task = None
     user = None
     bot = None
     spotify = None
     update_task = None
     schedule_task = None
     cancelled_exc = None
+    lease_clients = {}
 
     def _mark_shutting_down() -> None:
         try:
@@ -412,6 +485,42 @@ async def main():
                 marker()
         except (AttributeError, TypeError, RuntimeError, ValueError, OSError):
             pass
+
+    async def _on_lease_lost():
+        _mark_shutting_down()
+        for client in list(lease_clients.values()):
+            if client is None:
+                continue
+            try:
+                await client.disconnect()
+            except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
+                pass
+
+    async def _run_update_loop():
+        delay = 1.0
+        while True:
+            try:
+                await bot_module.patched_update_channel(user, bot, spotify)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _safe_log_error(ERROR_UPDATE_LOOP, e)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2.0, 60.0)
+
+    try:
+        lease = await acquire_device_lock(settings.tg_bot_token, _PROJECT_ROOT)
+    except DeviceLockBusy as e:
+        _safe_log_warning(INFO_SINGLE_INSTANCE_REMOTE, e.host)
+        await close_session()
+        await asyncio.to_thread(wait_for_enter)
+        return
+    except (ClientError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError) as e:
+        _safe_log_warning(ERROR_DEVICE_LOCK, e)
+        lease = None
+    if lease is not None:
+        lease_task = asyncio.create_task(lease.heartbeat_loop(on_lost=_on_lease_lost))
 
     async def shutdown_cb():
         _mark_shutting_down()
@@ -437,6 +546,11 @@ async def main():
         except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
             pass
         try:
+            if lease is not None:
+                await asyncio.wait_for(lease.release(), timeout=5.0)
+        except (ClientError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError) as e:
+            _safe_log_warning(ERROR_DEVICE_LOCK, e)
+        try:
             await close_mistral_client()
         except (ClientError, OSError, RuntimeError, AttributeError, TypeError, ValueError):
             pass
@@ -446,12 +560,16 @@ async def main():
             pass
 
     try:
+        if lease is not None and lease.lost:
+            await asyncio.to_thread(wait_for_enter)
+            return
         user = await _start_telegram_client(
             settings,
             session_name="user",
             start_log=INFO_AUTH_TG_USER,
             success_log=INFO_AUTH_TG_USER_SUCCESS,
         )
+        lease_clients["user"] = user
         bot = await _start_telegram_client(
             settings,
             session_name="bot",
@@ -459,6 +577,10 @@ async def main():
             success_log=INFO_AUTH_TG_BOT_SUCCESS,
             bot_token=settings.tg_bot_token,
         )
+        lease_clients["bot"] = bot
+        if lease is not None and lease.lost:
+            await asyncio.to_thread(wait_for_enter)
+            return
         spotify = await _start_spotify(settings)
         mistral_valid = await _check_genius_and_mistral(settings)
         await _prefetch_runtime_state(
@@ -471,10 +593,14 @@ async def main():
 
         await bot_module.setup_bot_commands(bot, user)
 
+        if lease is not None and lease.lost:
+            await asyncio.to_thread(wait_for_enter)
+            return
+
         _safe_log_info(INFO_STARTUP_COMPLETE)
         _safe_log_info(INFO_ENTERING_MAIN_LOOP)
 
-        update_task = asyncio.create_task(bot_module.patched_update_channel(user, bot, spotify))
+        update_task = asyncio.create_task(_run_update_loop())
         schedule_task = asyncio.create_task(
             schedule_daily_update_check(shutdown_cb, enabled=settings.enable_dep_updates)
         )
@@ -483,6 +609,15 @@ async def main():
         cancelled_exc = e
     finally:
         _mark_shutting_down()
+        if lease_task is not None:
+            if not lease_task.done():
+                lease_task.cancel()
+            try:
+                await lease_task
+            except asyncio.CancelledError:
+                pass
+            except (ClientError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError):
+                pass
         if schedule_task is not None and not schedule_task.done():
             schedule_task.cancel()
             try:
@@ -504,6 +639,9 @@ async def main():
         except (RPCError, ClientError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError):
             pass
 
+    if cancelled_exc is None and lease is not None and lease.lost:
+        await asyncio.to_thread(wait_for_enter)
+
     if cancelled_exc is not None:
         raise cancelled_exc
 
@@ -514,4 +652,6 @@ if __name__ == "__main__":
         _safe_log_info(INFO_APP_SHUTDOWN)
     except (ClientError, ConnectionError, asyncio.TimeoutError, OSError, RuntimeError, ValueError, TypeError) as e:
         _safe_log_error(ERROR_UNEXPECTED, e)
+        if not os.environ.get(ENV_NO_PAUSE):
+            wait_for_enter()
         raise

@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time
 import aiohttp
 import tempfile
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from typing import Optional, Callable, Any, Set
 
 from telethon import functions, types
 from telethon.errors import RPCError
+from telethon.helpers import add_surrogate
 from telethon.tl.functions.channels import EditPhotoRequest, EditTitleRequest
 from telethon.utils import get_input_photo
 from telethon.tl.types import (
@@ -36,6 +38,7 @@ from constants import (
     ERROR_FALLBACK_RESET,
     ERROR_MEDIA_UPDATE,
     ERROR_TEXT_UPDATE,
+    ERROR_UPDATE_LOOP,
     ERROR_UPDATING_MESSAGES,
     INFO_CHANNEL_DEFAULT_UPDATED,
     INFO_CHANNEL_UPDATED,
@@ -52,7 +55,7 @@ from constants import (
     REASON_TELEGRAM_UPDATE_FAILED,
     RELEASE_DATE_PREFIX,
 )
-from logger import _safe_log_info, _safe_log_error
+from logger import _safe_log_info, _safe_log_error, _safe_log_warning, dev_logger
 from utils.telethon_utils import safe_call_telethon
 from utils.http_session import init_session
 from lyrics.genius_search import search_lyrics_url
@@ -131,14 +134,55 @@ def _get_normalize_files_fn() -> Optional[Callable]:
         return _NORMALIZE_FILES_FN
     return None
 
+_MAX_COVER_BYTES = 15 * 1024 * 1024
+_MAX_TITLE_LENGTH = 128
+_UPDATE_ERROR_STATE = {"ts": 0.0, "sig": ""}
+
+def _is_allowed_cover_host(host: Optional[str]) -> bool:
+    value = (host or "").lower()
+    return (
+        value == "scdn.co"
+        or value.endswith(".scdn.co")
+        or value == "spotifycdn.com"
+        or value.endswith(".spotifycdn.com")
+    )
+
 async def _download_bytes(session, url: str) -> bytes:
     async with session.get(url) as resp:
         if not (200 <= resp.status < 300):
             raise RuntimeError(f"HTTP {resp.status}")
-        data = await resp.read()
+        if not _is_allowed_cover_host(getattr(resp.url, "host", None)):
+            raise RuntimeError("unexpected cover host")
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if content_type and not content_type.startswith("image/"):
+            raise RuntimeError("unexpected cover content type")
+        chunks = []
+        total = 0
+        async for chunk in resp.content.iter_chunked(65536):
+            total += len(chunk)
+            if total > _MAX_COVER_BYTES:
+                raise RuntimeError("cover is too large")
+            chunks.append(chunk)
+        data = b"".join(chunks)
         if not data:
             raise RuntimeError("empty body")
         return data
+
+def _utf16_len(value: str) -> int:
+    return len(add_surrogate(value))
+
+def _truncate_utf16(value: str, limit: int) -> str:
+    if _utf16_len(value) <= limit:
+        return value
+    out: list[str] = []
+    total = 0
+    for char in value:
+        char_len = _utf16_len(char)
+        if total + char_len > limit - 1:
+            break
+        out.append(char)
+        total += char_len
+    return "".join(out) + "…"
 
 async def _preupload_cover_photo_external(bot_client, cover_url: str, channel: PeerChannel) -> Optional[_CoverPreuploadResult]:
     try:
@@ -263,6 +307,11 @@ def _normalize_track_info(data: Optional[dict]) -> dict:
     return {
         "track_id": data.get("track_id"),
     }
+
+_MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
 
 def _release_date_base(release_date: Optional[str], precision: Optional[str]) -> Optional[str]:
     if not isinstance(release_date, str) or not release_date:
@@ -420,12 +469,16 @@ async def _collect_channel_commit_payload(
         }
         if lyrics_task is not None:
             lyrics_result = phase1_results_by_task.get(lyrics_task)
-            if isinstance(lyrics_result, str):
+            if isinstance(lyrics_result, BaseException):
+                _safe_log_warning(ERROR_UPDATE_LOOP, lyrics_result, logger=dev_logger)
+            elif isinstance(lyrics_result, str):
                 payload.genius_url = lyrics_result
 
         if cover_task is not None:
             cover_result = phase1_results_by_task.get(cover_task)
-            if isinstance(cover_result, (Photo, InputFile, InputFileBig)):
+            if isinstance(cover_result, BaseException):
+                _safe_log_warning(ERROR_UPDATE_LOOP, cover_result, logger=dev_logger)
+            elif isinstance(cover_result, (Photo, InputFile, InputFileBig)):
                 payload.uploaded_photo = cover_result
 
     payload.prepared_message_content, payload.prepared_entities = _build_playing_message_payload(
@@ -534,15 +587,15 @@ def write_track_info(track_id):
     track_info_cache = {"track_id": track_id}
     try:
         _get_cache_handler().save_track_id(track_id)
-    except (OSError, ValueError, TypeError, RuntimeError):
-        pass
+    except (OSError, ValueError, TypeError, RuntimeError) as e:
+        _safe_log_warning(ERROR_UPDATE_LOOP, e)
 
     normalize_files = _get_normalize_files_fn()
     try:
         if callable(normalize_files):
             normalize_files()
-    except (OSError, ValueError, TypeError):
-        pass
+    except (OSError, ValueError, TypeError) as e:
+        _safe_log_warning(ERROR_UPDATE_LOOP, e)
     return True
 
 async def get_current_track(spotify):
@@ -564,14 +617,14 @@ async def get_current_track(spotify):
                 continue
             name = artist.get("name")
             url = (artist.get("external_urls") or {}).get("spotify")
-            if not name or not url:
+            if not name:
                 continue
             artist_names_list.append(str(name))
-            artist_urls.append(str(url))
+            artist_urls.append(str(url) if url else None)
         track_url = (item.get("external_urls") or {}).get("spotify")
         album = item.get("album") or {}
         album_url = (album.get("external_urls") or {}).get("spotify")
-        if track_id and track_name and artist_names_list and track_url and album_url:
+        if track_id and track_name and artist_names_list:
             artist_names = ", ".join(artist_names_list)
             album_name = album.get("name") or ""
             release_date = album.get("release_date") or ""
@@ -580,8 +633,9 @@ async def get_current_track(spotify):
             if release_date:
                 base = _release_date_base(release_date, release_date_precision) or release_date
                 try:
-                    formatted_release_date = datetime.strptime(base, "%Y-%m-%d").strftime("%d %B %Y")
-                except (ValueError, TypeError):
+                    parsed_date = datetime.strptime(base, "%Y-%m-%d")
+                    formatted_release_date = f"{parsed_date.day:02d} {_MONTH_NAMES[parsed_date.month - 1]} {parsed_date.year}"
+                except (ValueError, TypeError, IndexError):
                     formatted_release_date = release_date
             cover_url = None
             cover_url = _select_spotify_cover_url(album.get("images"))
@@ -673,28 +727,32 @@ def _build_playing_message_payload(
 
     if genius_url:
         message_content += f"\n\n{LYRICS_ON_GENIUS}"
+    surrogate_content = add_surrogate(message_content)
     entities = []
     current_offset = 0
     for i, name in enumerate(artist_names_list):
-        append_entity(entities, MessageEntityBold, current_offset, len(name))
+        name_len = _utf16_len(name)
+        append_entity(entities, MessageEntityBold, current_offset, name_len)
         if i < len(artist_urls_local) and artist_urls_local[i]:
-            append_entity(entities, MessageEntityTextUrl, current_offset, len(name), url=artist_urls_local[i])
-        current_offset += len(name) + (2 if i < len(artist_names_list) - 1 else 0)
-    track_start = message_content.index(" – ") + len(" – ")
-    album_start = message_content.index(album_label) + len(album_label)
-    release_date_start = message_content.index(RELEASE_DATE_PREFIX) + len(RELEASE_DATE_PREFIX)
+            append_entity(entities, MessageEntityTextUrl, current_offset, name_len, url=artist_urls_local[i])
+        current_offset += name_len + (2 if i < len(artist_names_list) - 1 else 0)
+    track_start = surrogate_content.index(" – ") + len(" – ")
+    album_start = surrogate_content.index(album_label) + len(album_label)
+    release_date_start = surrogate_content.index(RELEASE_DATE_PREFIX) + len(RELEASE_DATE_PREFIX)
     if track_name:
-        append_entity(entities, MessageEntityBold, track_start, len(track_name))
+        track_len = _utf16_len(track_name)
+        append_entity(entities, MessageEntityBold, track_start, track_len)
         if track_url:
-            append_entity(entities, MessageEntityTextUrl, track_start, len(track_name), url=track_url)
+            append_entity(entities, MessageEntityTextUrl, track_start, track_len, url=track_url)
     if album_name and album_url:
-        append_entity(entities, MessageEntityTextUrl, album_start, len(album_name), url=album_url)
+        append_entity(entities, MessageEntityTextUrl, album_start, _utf16_len(album_name), url=album_url)
     if release_date:
-        append_entity(entities, types.MessageEntityItalic, release_date_start, len(release_date))
+        append_entity(entities, types.MessageEntityItalic, release_date_start, _utf16_len(release_date))
     if genius_url:
-        lyrics_start = message_content.rindex(LYRICS_ON_GENIUS)
-        append_entity(entities, MessageEntityTextUrl, lyrics_start, len(LYRICS_ON_GENIUS), url=genius_url)
-        append_entity(entities, MessageEntityUnderline, lyrics_start, len(LYRICS_ON_GENIUS))
+        lyrics_start = surrogate_content.rindex(LYRICS_ON_GENIUS)
+        lyrics_len = _utf16_len(LYRICS_ON_GENIUS)
+        append_entity(entities, MessageEntityTextUrl, lyrics_start, lyrics_len, url=genius_url)
+        append_entity(entities, MessageEntityUnderline, lyrics_start, lyrics_len)
     return message_content, entities
 
 async def reset_to_default_state(bot_client, reason: str = ""):
@@ -778,7 +836,8 @@ async def reset_to_default_state(bot_client, reason: str = ""):
 
         default_media_applied = True
         return True
-    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError):
+    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TypeError, RuntimeError) as e:
+        _safe_log_error(ERROR_UPDATE_LOOP, e)
         return False
 
 async def update_messages(bot_client, cover_url, is_playing, artist_names, track_name, album_name, release_date, artist_urls, track_url, album_url, track_changed=False, current_track=None, genius_url=None, uploaded_photo=None, cover_media_unchanged=False, prepared_message_content=None, prepared_entities=None, commit_operations=None):
@@ -973,7 +1032,7 @@ async def update_channel_info(bot_client, track_title, is_playing, uploaded_phot
             async def update_title_task():
                 nonlocal update_ok
                 try:
-                    await safe_call_telethon(bot_client, EditTitleRequest(channel, channel_name))
+                    await safe_call_telethon(bot_client, EditTitleRequest(channel, _truncate_utf16(channel_name, _MAX_TITLE_LENGTH)))
                     return True
                 except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                     _safe_log_error(ERROR_CHANNEL_TITLE_UPDATE, e)
@@ -992,8 +1051,11 @@ async def update_channel_info(bot_client, track_title, is_playing, uploaded_phot
                                 media=types.InputMediaUploadedPhoto(file)
                             )
                         )
-                        if input_photo and getattr(input_photo, "photo", None):
-                            await safe_call_telethon(bot_client, EditPhotoRequest(channel, input_photo.photo))
+                        if input_photo is None or not getattr(input_photo, "photo", None):
+                            _safe_log_error(ERROR_CHANNEL_PHOTO_UPDATE, "empty upload response")
+                            update_ok = False
+                            return False
+                        await safe_call_telethon(bot_client, EditPhotoRequest(channel, input_photo.photo))
                         return True
                     except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                         _safe_log_error(ERROR_CHANNEL_PHOTO_UPDATE, e)
@@ -1014,7 +1076,7 @@ async def update_channel_info(bot_client, track_title, is_playing, uploaded_phot
                 global force_default_requested
                 nonlocal update_ok
                 try:
-                    await safe_call_telethon(bot_client, EditTitleRequest(channel, track_title))
+                    await safe_call_telethon(bot_client, EditTitleRequest(channel, _truncate_utf16(track_title, _MAX_TITLE_LENGTH)))
                     return True
                 except (RPCError, ConnectionError, asyncio.TimeoutError, OSError) as e:
                     _safe_log_error(ERROR_CHANNEL_TITLE_UPDATE, e)
@@ -1133,5 +1195,15 @@ async def update_channel(bot_client, spotify_client):
         if force_default_requested:
             return None
         return track_id if is_playing else None
-    except (RPCError, ConnectionError, asyncio.TimeoutError, OSError, aiohttp.ClientError, ValueError, TypeError, RuntimeError):
+    except Exception as e:
+        now = time.monotonic()
+        try:
+            err_text = str(e)
+        except (ValueError, TypeError, UnicodeError):
+            err_text = ""
+        sig = f"{type(e).__name__}:{err_text}"
+        if now - _UPDATE_ERROR_STATE["ts"] >= 60.0 or sig != _UPDATE_ERROR_STATE["sig"]:
+            _UPDATE_ERROR_STATE["ts"] = now
+            _UPDATE_ERROR_STATE["sig"] = sig
+            _safe_log_error(ERROR_UPDATE_LOOP, e)
         return cached_track_id

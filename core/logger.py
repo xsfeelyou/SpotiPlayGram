@@ -1,3 +1,4 @@
+import ctypes
 import logging
 import logging.handlers
 import os
@@ -7,6 +8,8 @@ import time
 import traceback
 from typing import Any, Dict, Iterable, List, Optional
 
+from constants import ENV_LOG_DIR, ERROR_LOG_SETUP
+
 _DEFAULT_EXCLUDED_DIRS = {
     "venv", ".venv", "env", ".env", "myvenv", "myenv",
     "virtualenv",
@@ -14,6 +17,72 @@ _DEFAULT_EXCLUDED_DIRS = {
 }
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+_ENABLE_PROCESSED_OUTPUT = 0x0001
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_STD_OUTPUT_HANDLE = 0xFFFFFFF5
+_STD_ERROR_HANDLE = 0xFFFFFFF4
+_INVALID_HANDLE_VALUE = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
+
+def _set_windows_console_mode(handle_id: int) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetConsoleMode.restype = wintypes.BOOL
+        handle = kernel32.GetStdHandle(handle_id)
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            return False
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        new_mode = mode.value | _ENABLE_PROCESSED_OUTPUT | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if new_mode == mode.value:
+            return True
+        return bool(kernel32.SetConsoleMode(handle, new_mode))
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return False
+
+def _enable_windows_console_ansi() -> bool:
+    if os.name != "nt":
+        return False
+    stdout_enabled = _set_windows_console_mode(_STD_OUTPUT_HANDLE)
+    _set_windows_console_mode(_STD_ERROR_HANDLE)
+    return stdout_enabled
+
+def _stream_supports_ansi(stream: Any) -> bool:
+    if stream is None:
+        return False
+    windows_ansi = _enable_windows_console_ansi() if os.name == "nt" else False
+    force_color = os.environ.get("FORCE_COLOR", "")
+    if force_color and force_color != "0":
+        return True
+    if "NO_COLOR" in os.environ:
+        return False
+    try:
+        if not stream.isatty():
+            return False
+    except (AttributeError, ValueError, OSError):
+        return False
+    if os.name == "nt":
+        return windows_ansi
+    return os.environ.get("TERM", "").lower() != "dumb"
+
+def _stream_supports_char(stream, char: str) -> bool:
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        char.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
 
 def _is_project_python_file(
     path: str,
@@ -189,9 +258,13 @@ class LoggerConfig:
         duplicate_errors: bool = True,
     ):
         self.root_dir = os.path.normcase(os.path.abspath(root_dir or os.getcwd()))
+        env_log_dir = os.environ.get(ENV_LOG_DIR)
+        if env_log_dir:
+            log_dir = env_log_dir
         if log_dir is None:
             log_dir = os.path.join(self.root_dir, "logs")
         self.log_dir = os.path.normcase(os.path.abspath(log_dir)) if log_dir else None
+        self.file_logging_available = True
         self.excluded_dirs = {seg.lower() for seg in (excluded_dirs or _DEFAULT_EXCLUDED_DIRS)}
         if excluded_files is None:
             excluded_files = [__file__]
@@ -207,7 +280,7 @@ class LoggerConfig:
         self.user_logger_name = user_logger_name
         self.dev_logger_name = dev_logger_name
         self.use_emojis = use_emojis
-        self.use_color = True if use_color is None else bool(use_color)
+        self.use_color = None if use_color is None else bool(use_color)
         self.install_excepthook = install_excepthook
         self.duplicate_errors = duplicate_errors
 
@@ -281,8 +354,19 @@ class LoggerManager:
         self._setup_exception_handling()
 
     def _setup_logging_environment(self) -> None:
-        if self.config.log_dir:
+        if not self.config.log_dir:
+            return
+        try:
             os.makedirs(self.config.log_dir, exist_ok=True)
+            if os.name != "nt":
+                os.chmod(self.config.log_dir, 0o700)
+        except OSError as e:
+            self.config.file_logging_available = False
+            try:
+                if sys.__stderr__ is not None:
+                    sys.__stderr__.write(ERROR_LOG_SETUP.format(e) + "\n")
+            except (AttributeError, OSError, ValueError):
+                pass
 
     def _reset_logger(self, logger: logging.Logger) -> None:
         for handler in list(logger.handlers):
@@ -349,36 +433,62 @@ class LoggerManager:
         return logger
 
     def _create_console_handler(self, level: int) -> Optional[logging.StreamHandler]:
+        if sys.stdout is None:
+            return None
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
         handler = logging.StreamHandler(sys.stdout)
         handler.setLevel(level)
 
-        if self.config.use_color:
+        use_color = False
+        if self.config.use_color is not False:
+            use_color = _stream_supports_ansi(sys.stdout)
+        if use_color:
             formatter = AnsiColorFormatter(
                 self.config.console_format_color,
                 datefmt=self.config.date_format,
                 level_colors=self.config.level_colors,
             )
         else:
-            formatter = logging.Formatter(
-                self.config.console_format_plain,
-                datefmt=self.config.date_format,
+            formatter = AnsiStrippingFormatter(
+                logging.Formatter(
+                    self.config.console_format_plain,
+                    datefmt=self.config.date_format,
+                )
             )
         formatter.converter = time.localtime
         handler.setFormatter(formatter)
-        handler.addFilter(LevelEmojiFilter(self.config.level_emojis, self.config.use_emojis))
+        use_emojis = self.config.use_emojis and _stream_supports_char(sys.stdout, "✅")
+        handler.addFilter(LevelEmojiFilter(self.config.level_emojis, use_emojis))
 
         return handler
 
     def _create_file_handler(self, filename: str, level: int) -> Optional[logging.handlers.RotatingFileHandler]:
-        if not self.config.log_dir:
+        if not self.config.log_dir or not self.config.file_logging_available:
             return None
-        handler = logging.handlers.RotatingFileHandler(
-            os.path.join(self.config.log_dir, filename),
-            mode="a",
-            maxBytes=self.config.max_bytes,
-            backupCount=self.config.backup_count,
-            encoding=self.config.encoding,
-        )
+        path = os.path.join(self.config.log_dir, filename)
+        try:
+            handler = logging.handlers.RotatingFileHandler(
+                path,
+                mode="a",
+                maxBytes=self.config.max_bytes,
+                backupCount=self.config.backup_count,
+                encoding=self.config.encoding,
+            )
+        except (OSError, ValueError) as e:
+            try:
+                if sys.__stderr__ is not None:
+                    sys.__stderr__.write(ERROR_LOG_SETUP.format(e) + "\n")
+            except (AttributeError, OSError, ValueError):
+                pass
+            return None
+        if os.name != "nt":
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         handler.setLevel(level)
 
         return handler
@@ -463,7 +573,7 @@ def _safe_log(
         manager = get_logger_manager()
         target_loggers = [logger] if logger is not None else [manager.user_logger, manager.dev_logger]
         stacklevel = kwargs.pop("stacklevel", 1)
-        stacklevel = stacklevel + 1
+        stacklevel = stacklevel + 2
         for target_logger in target_loggers:
             if target_logger is None:
                 continue
@@ -486,15 +596,28 @@ def _safe_log(
                     extra[_SKIP_DUPLICATION_ATTR] = True
                     call_kwargs["extra"] = extra
             log_fn(message, **call_kwargs)
-    except (ValueError, TypeError, OSError):
-        return
+    except Exception as e:
+        try:
+            if sys.__stderr__ is not None:
+                sys.__stderr__.write(f"Logging failure: {e}; message: {message}\n")
+        except (AttributeError, OSError, ValueError):
+            pass
 
 def _safe_log_info(template: Any, *args, logger: Optional[logging.Logger] = None, **kwargs) -> None:
     kwargs.setdefault("stacklevel", 2)
     _safe_log(logger, "info", template, args, **kwargs)
 
+def _safe_log_warning(template: Any, *args, logger: Optional[logging.Logger] = None, **kwargs) -> None:
+    kwargs.setdefault("stacklevel", 2)
+    _safe_log(logger, "warning", template, args, **kwargs)
+
 def _safe_log_error(template: Any, *args, logger: Optional[logging.Logger] = None, **kwargs) -> None:
     kwargs.setdefault("stacklevel", 2)
+    if "exc_info" not in kwargs:
+        for arg in args:
+            if isinstance(arg, BaseException):
+                kwargs["exc_info"] = arg
+                break
     _safe_log(logger, "error", template, args, **kwargs)
 
 _logger_manager = configure_logging()

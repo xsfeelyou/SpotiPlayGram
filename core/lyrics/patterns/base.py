@@ -2,6 +2,7 @@ import unicodedata
 import re
 import json
 import os
+import time
 import importlib
 from itertools import combinations
 from functools import lru_cache
@@ -10,6 +11,9 @@ try:
     from anyascii import anyascii as _anyascii_impl
 except ImportError:
     _anyascii_impl = None
+
+from constants import ERROR_PATTERNS_CORRUPT, ERROR_UNEXPECTED
+from logger import _safe_log_error
 
 from .symbols import (
     _CHAR_EQUIV_MAP,
@@ -30,8 +34,15 @@ _FEAT_CACHE: list[str] | None = None
 _TAG_CACHE: list[str] | None = None
 _FEAT_VERSION: int = 0
 _TAG_VERSION: int = 0
+_FEAT_SET_CACHE: set[str] | None = None
+_TAG_SET_CACHE: set[str] | None = None
+_FEAT_SET_VERSION: int = -1
+_TAG_SET_VERSION: int = -1
+_BASE_PATTERNS_CACHE: tuple[list[str], list[str]] | None = None
 _PENDING_FEAT_RELOAD: bool = False
 _PENDING_TAG_RELOAD: bool = False
+_CORRUPT_SENTINEL = object()
+_ROMAN_L_I_MAX_SEGMENTS = 6
 
 _APOSTROPHE_TRANSLATION = {ord(ch): "'" for ch in APOSTROPHE_CHARS if ch != "'"}
 
@@ -90,17 +101,31 @@ def _unique_sorted(items: Iterable[str]) -> list[str]:
     out.sort(key=lambda x: (len(x), x))
     return out
 
+def _backup_corrupt_file(path: str) -> str:
+    backup = f"{path}.corrupt-{int(time.time())}"
+    try:
+        os.replace(path, backup)
+        return backup
+    except OSError as e:
+        _safe_log_error(ERROR_UNEXPECTED, e)
+        return path
+
 def _read_json_obj_raw(path: str) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+    except OSError:
         return None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        backup = _backup_corrupt_file(path)
+        _safe_log_error(ERROR_PATTERNS_CORRUPT, backup)
+        return _CORRUPT_SENTINEL
 
 def _load_builtin_patterns(module_name: str, attr: str) -> list[str]:
     try:
         mod = importlib.import_module(f".{module_name}", package=__package__)
-    except ImportError:
+    except ImportError as e:
+        _safe_log_error(ERROR_UNEXPECTED, e)
         return []
     value = getattr(mod, attr, None)
     return list(value) if isinstance(value, (list, tuple)) else []
@@ -112,11 +137,15 @@ def _ensure_user_patterns_dir() -> None:
         return
 
 def _read_base_patterns() -> tuple[list[str], list[str]]:
+    global _BASE_PATTERNS_CACHE
+    if _BASE_PATTERNS_CACHE is not None:
+        return _BASE_PATTERNS_CACHE
     base_feat_raw = _load_builtin_patterns("feat", "PATTERNS")
     base_tag_raw = _load_builtin_patterns("tag", "PATTERNS")
     base_feat = _unique_sorted([str(x) for x in base_feat_raw if x is not None])
     base_tag = _unique_sorted([str(x) for x in base_tag_raw if x is not None])
-    return base_feat, base_tag
+    _BASE_PATTERNS_CACHE = (base_feat, base_tag)
+    return _BASE_PATTERNS_CACHE
 
 def _read_user_delta_raw(path: str) -> tuple[Any, bool]:
     exists = False
@@ -207,6 +236,8 @@ def _write_user_delta(path: str, add: list[str], exclude_base: list[str]) -> Non
     os.replace(tmp, path)
 
 def _delta_needs_write(raw: Optional[dict], exists: bool, add: list[str], exclude_base: list[str]) -> bool:
+    if raw is _CORRUPT_SENTINEL:
+        return False
     desired = {"add": list(add), "exclude_base": list(exclude_base)}
     if exists:
         return raw != desired
@@ -220,20 +251,24 @@ def _persist_user_deltas(
     feat_excl: list[str],
     tag_add: list[str],
     tag_excl: list[str],
-) -> None:
+) -> bool:
     global _PENDING_FEAT_RELOAD, _PENDING_TAG_RELOAD
+    saved = True
     if tag_needs_write:
         try:
             _write_user_delta(_TAG_USER_PATH, tag_add, tag_excl)
             _PENDING_TAG_RELOAD = True
-        except OSError:
-            pass
+        except OSError as e:
+            _safe_log_error(ERROR_UNEXPECTED, e)
+            saved = False
     if feat_needs_write:
         try:
             _write_user_delta(_FEAT_USER_PATH, feat_add, feat_excl)
             _PENDING_FEAT_RELOAD = True
-        except OSError:
-            pass
+        except OSError as e:
+            _safe_log_error(ERROR_UNEXPECTED, e)
+            saved = False
+    return saved
 
 def get_feat_patterns_version() -> int:
     if _FEAT_CACHE is None:
@@ -367,14 +402,15 @@ def add_patterns(kind: str, patterns: Iterable[str]) -> list[str]:
 
     feat_needs_write = _delta_needs_write(raw_feat, feat_exists, feat_add, feat_excl)
     tag_needs_write = _delta_needs_write(raw_tag, tag_exists, tag_add, tag_excl)
-    _persist_user_deltas(
+    if not _persist_user_deltas(
         feat_needs_write=feat_needs_write,
         tag_needs_write=tag_needs_write,
         feat_add=feat_add,
         feat_excl=feat_excl,
         tag_add=tag_add,
         tag_excl=tag_excl,
-    )
+    ):
+        raise OSError("failed to persist patterns")
 
     return feat_res if kind == "feat" else tag_res
 
@@ -419,14 +455,15 @@ def remove_patterns(kind: str, patterns: Iterable[str]) -> list[str]:
 
     feat_needs_write = _delta_needs_write(raw_feat, feat_exists, feat_add, feat_excl)
     tag_needs_write = _delta_needs_write(raw_tag, tag_exists, tag_add, tag_excl)
-    _persist_user_deltas(
+    if not _persist_user_deltas(
         feat_needs_write=feat_needs_write,
         tag_needs_write=tag_needs_write,
         feat_add=feat_add,
         feat_excl=feat_excl,
         tag_add=tag_add,
         tag_excl=tag_excl,
-    )
+    ):
+        raise OSError("failed to persist patterns")
 
     return feat_res if kind == "feat" else tag_res
 
@@ -436,10 +473,16 @@ def pattern_exists(kind: str, pattern: str) -> bool:
         return False
     if kind not in ("feat", "tag"):
         return False
-    feat_res, tag_res = _compute_patterns_pair()
+    global _FEAT_SET_CACHE, _TAG_SET_CACHE, _FEAT_SET_VERSION, _TAG_SET_VERSION
     if kind == "feat":
-        return p in set(feat_res)
-    return p in set(tag_res)
+        if _FEAT_SET_CACHE is None or _FEAT_SET_VERSION != _FEAT_VERSION:
+            _FEAT_SET_CACHE = set(get_feat_patterns())
+            _FEAT_SET_VERSION = _FEAT_VERSION
+        return p in _FEAT_SET_CACHE
+    if _TAG_SET_CACHE is None or _TAG_SET_VERSION != _TAG_VERSION:
+        _TAG_SET_CACHE = set(get_tag_patterns())
+        _TAG_SET_VERSION = _TAG_VERSION
+    return p in _TAG_SET_CACHE
 
 def apply_symbol_letter_equiv(text: Optional[str]) -> Optional[str]:
     if text is None:
@@ -509,7 +552,10 @@ def generate_roman_l_i_variants(text: Optional[str]) -> list[str]:
         return [s]
 
     n = len(seg_original)
+    if n > _ROMAN_L_I_MAX_SEGMENTS:
+        return [s]
     variants: list[str] = []
+    seen: set[str] = set()
 
     for mask in range(1 << n):
         res_parts: list[str] = []
@@ -526,7 +572,8 @@ def generate_roman_l_i_variants(text: Optional[str]) -> list[str]:
         if last_end < len(s):
             res_parts.append(s[last_end:])
         v = "".join(res_parts)
-        if v not in variants:
+        if v not in seen:
+            seen.add(v)
             variants.append(v)
     return variants or [s]
 

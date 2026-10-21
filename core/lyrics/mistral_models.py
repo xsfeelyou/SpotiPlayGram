@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import re
+import time
 from typing import Optional
 
 import aiohttp
@@ -17,11 +19,14 @@ from .mistral_ai import update_models_cache
 
 _MISTRAL_NUMERIC_VARIANT_RE = re.compile(r"-(\d+(?:[.-]\d+)*)$")
 _MISTRAL_BUILD_VARIANT_RE = re.compile(r"-c\d+(?:-[a-z]\d+)*-\d+$", re.IGNORECASE)
-_MISTRAL_MODEL_VALIDATION_CONCURRENCY = 100
-_MISTRAL_MODEL_VALIDATION_TIMEOUT_SECONDS = 30.0
+_MISTRAL_MODEL_VALIDATION_CONCURRENCY = 16
+_MISTRAL_MODEL_VALIDATION_TIMEOUT_SECONDS = 12.0
+_MISTRAL_MODEL_VALIDATION_MAX_ATTEMPTS = 2
 _MISTRAL_MODEL_CAPABILITIES_TIMEOUT_SECONDS = 30.0
-_MISTRAL_MODEL_CAPABILITIES_MAX_RETRIES = 1
-_MISTRAL_MODEL_CAPABILITIES_CONCURRENCY = 100
+_MISTRAL_MODEL_CAPABILITIES_MAX_RETRIES = 2
+_MISTRAL_MODEL_CAPABILITIES_CONCURRENCY = 16
+_MISTRAL_MODELS_MENU_CACHE_TTL_SECONDS = 600.0
+_MISTRAL_MODELS_RESULT_CACHE: dict[str, tuple[float, list[str], str]] = {}
 
 def _model_base_of(value: str) -> str:
     if value.endswith("-latest"):
@@ -81,6 +86,55 @@ def _get_cached_model_info(cached_models: dict, model_id: str) -> Optional[dict]
             return info
     return None
 
+def _models_result_cache_key(api_key: str, include_details: bool, model_ids_to_cache: Optional[list[str]]) -> str:
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    ids_key = ",".join(sorted(str(model_id).strip() for model_id in (model_ids_to_cache or []) if str(model_id).strip()))
+    return f"{digest}|{int(include_details)}|{ids_key}"
+
+def _models_result_cache_get(cache_key: str) -> Optional[tuple[list[str], str]]:
+    entry = _MISTRAL_MODELS_RESULT_CACHE.get(cache_key)
+    if entry is None:
+        return None
+    expires_at, ids, details = entry
+    if expires_at <= time.monotonic():
+        _MISTRAL_MODELS_RESULT_CACHE.pop(cache_key, None)
+        return None
+    return list(ids), details
+
+def _models_result_cache_put(cache_key: str, ids: list[str], details: str) -> None:
+    now = time.monotonic()
+    for stale_key in [key for key, value in _MISTRAL_MODELS_RESULT_CACHE.items() if value[0] <= now]:
+        _MISTRAL_MODELS_RESULT_CACHE.pop(stale_key, None)
+    _MISTRAL_MODELS_RESULT_CACHE[cache_key] = (now + _MISTRAL_MODELS_MENU_CACHE_TTL_SECONDS, list(ids), details)
+
+def _group_display_models(display_models: dict[str, dict]) -> list[list[str]]:
+    parent: dict[str, str] = {}
+
+    def find(name: str) -> str:
+        parent.setdefault(name, name)
+        root = name
+        while parent[root] != root:
+            root = parent[root]
+        while parent[name] != root:
+            parent[name], name = root, parent[name]
+        return root
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for display_id, info in display_models.items():
+        find(display_id)
+        aliases = info.get("aliases") or []
+        for alias in aliases:
+            union(display_id, str(alias))
+    grouped: dict[str, list[str]] = {}
+    for display_id in display_models:
+        grouped.setdefault(find(display_id), []).append(display_id)
+    return list(grouped.values())
+
 async def _validate_mistral_chat_models(
     session: aiohttp.ClientSession,
     headers: dict,
@@ -90,25 +144,40 @@ async def _validate_mistral_chat_models(
     semaphore = asyncio.Semaphore(_MISTRAL_MODEL_VALIDATION_CONCURRENCY)
     url_chat = "https://api.mistral.ai/v1/chat/completions"
 
-    async def validate_one(display_id: str, info: dict) -> Optional[tuple[str, dict]]:
+    async def validate_group(display_ids: list[str]) -> list[tuple[str, dict]]:
         payload = {
-            "model": info["id"],
+            "model": display_ids[0],
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
             "temperature": 0,
         }
         async with semaphore:
-            try:
-                async with session.post(url_chat, headers=headers, json=payload, timeout=timeout) as r:
-                    if r.status in (400, 404, 422):
-                        return None
-                    return display_id, info
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                return display_id, info
+            for attempt in range(_MISTRAL_MODEL_VALIDATION_MAX_ATTEMPTS):
+                try:
+                    async with session.post(url_chat, headers=headers, json=payload, timeout=timeout) as r:
+                        if r.status == 200:
+                            return [(display_id, display_models[display_id]) for display_id in display_ids]
+                        if r.status == 429:
+                            limit_header = str(r.headers.get("x-ratelimit-limit-req-minute") or "").strip()
+                            if limit_header != "0" and attempt + 1 < _MISTRAL_MODEL_VALIDATION_MAX_ATTEMPTS:
+                                await asyncio.sleep(0.5 * (attempt + 1))
+                                continue
+                            return []
+                except asyncio.CancelledError:
+                    raise
+                except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+                    return []
+                except Exception:
+                    return []
+        return []
 
-    tasks = [validate_one(display_id, info) for display_id, info in display_models.items()]
+    tasks = [validate_group(display_ids) for display_ids in _group_display_models(display_models)]
     results = await asyncio.gather(*tasks)
-    return {display_id: info for result in results if result for display_id, info in [result]}
+    valid: dict[str, dict] = {}
+    for group_result in results:
+        for display_id, info in group_result:
+            valid[display_id] = info
+    return valid
 
 def _build_models_for_cache(items: list[dict], valid_models: dict[str, dict]) -> list[dict]:
     models_by_id: dict[str, dict] = {}
@@ -144,6 +213,32 @@ def _build_models_for_cache(items: list[dict], valid_models: dict[str, dict]) ->
                     target_efforts.append(mode)
     return list(models_by_id.values())
 
+def _dedupe_models_for_cache(models: list[dict]) -> list[dict]:
+    groups: dict[tuple, list[dict]] = {}
+    for item in models:
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        aliases = item.get("aliases") or []
+        if not isinstance(aliases, list):
+            aliases = []
+        names = frozenset([model_id, *sorted(str(alias) for alias in aliases if alias)])
+        known_reasoning = item.get("reasoning")
+        reasoning_key = known_reasoning if isinstance(known_reasoning, bool) else None
+        known_efforts = item.get("reasoning_efforts")
+        efforts_key = tuple(str(mode).strip().lower() for mode in known_efforts) if isinstance(known_efforts, list) else ()
+        groups.setdefault((names, reasoning_key, efforts_key), []).append(item)
+    deduped: list[dict] = []
+    for (names, reasoning_key, efforts_key), group in groups.items():
+        sorted_names = sorted(names)
+        merged: dict = {"id": sorted_names[0], "aliases": sorted_names[1:]}
+        if isinstance(reasoning_key, bool):
+            merged["reasoning"] = reasoning_key
+        if efforts_key:
+            merged["reasoning_efforts"] = list(efforts_key)
+        deduped.append(merged)
+    return deduped
+
 def _model_known_reasoning(item: dict) -> Optional[bool]:
     capabilities = item.get("capabilities")
     if isinstance(capabilities, dict):
@@ -173,20 +268,58 @@ def _model_known_reasoning_efforts(item: dict) -> list[str]:
             values.append(mode)
     return values
 
+_MISTRAL_MODELS_FETCH_LOCK: Optional[asyncio.Lock] = None
+
+def _models_fetch_lock() -> asyncio.Lock:
+    global _MISTRAL_MODELS_FETCH_LOCK
+    if _MISTRAL_MODELS_FETCH_LOCK is None:
+        _MISTRAL_MODELS_FETCH_LOCK = asyncio.Lock()
+    return _MISTRAL_MODELS_FETCH_LOCK
+
+def is_mistral_models_cached(api_key: Optional[str]) -> bool:
+    if not api_key:
+        return False
+    return _models_result_cache_get(_models_result_cache_key(api_key, True, None)) is not None
+
 async def fetch_mistral_models_ids(
     api_key: Optional[str],
     *,
     include_details: bool = True,
     model_ids_to_cache: Optional[list[str]] = None,
+    force_refresh: bool = False,
 ) -> tuple[list[str], str, Optional[str]]:
     if not api_key:
         return [], "", ERROR_AUTH_MISTRAL_API_KEY_MISSING
 
+    cache_key = _models_result_cache_key(api_key, include_details, model_ids_to_cache)
+    if not force_refresh:
+        cached_result = _models_result_cache_get(cache_key)
+        if cached_result is not None:
+            return cached_result[0], cached_result[1], None
+    async with _models_fetch_lock():
+        if not force_refresh:
+            cached_result = _models_result_cache_get(cache_key)
+            if cached_result is not None:
+                return cached_result[0], cached_result[1], None
+        return await _fetch_mistral_models_ids(
+            api_key,
+            cache_key,
+            include_details=include_details,
+            model_ids_to_cache=model_ids_to_cache,
+        )
+
+async def _fetch_mistral_models_ids(
+    api_key: str,
+    cache_key: str,
+    *,
+    include_details: bool,
+    model_ids_to_cache: Optional[list[str]],
+) -> tuple[list[str], str, Optional[str]]:
     url = "https://api.mistral.ai/v1/models"
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     try:
         session = init_session()
-        timeout = aiohttp.ClientTimeout(total=8.0)
+        timeout = aiohttp.ClientTimeout(total=60.0)
         async with session.get(url, headers=headers, timeout=timeout) as resp:
             if resp.status < 200 or resp.status >= 300:
                 txt = await resp.text()
@@ -199,6 +332,9 @@ async def fetch_mistral_models_ids(
         for item in data:
             mid = str(item.get("id")) if item.get("id") is not None else None
             if not mid:
+                continue
+            capabilities = item.get("capabilities")
+            if isinstance(capabilities, dict) and capabilities.get("completion_chat") is False:
                 continue
             aliases = item.get("aliases") or item.get("alias") or []
             if not isinstance(aliases, (list, tuple)):
@@ -257,23 +393,30 @@ async def fetch_mistral_models_ids(
                 for model_id in requested_ids
                 if model_id in display_models
             }
-        valid_models = await _validate_mistral_chat_models(session, headers, models_to_validate)
-        models_for_cache = _build_models_for_cache(items, valid_models)
+        valid_models = await _validate_mistral_chat_models(
+            session,
+            headers,
+            models_to_validate,
+        )
+        models_for_cache = _dedupe_models_for_cache(_build_models_for_cache(items, valid_models))
         if models_for_cache:
             models_cache = await update_models_cache(
                 models_for_cache,
                 api_key,
-                force_recheck=True,
+                force_recheck=False,
                 max_retries=_MISTRAL_MODEL_CAPABILITIES_MAX_RETRIES,
                 timeout_seconds=_MISTRAL_MODEL_CAPABILITIES_TIMEOUT_SECONDS,
                 concurrency=_MISTRAL_MODEL_CAPABILITIES_CONCURRENCY,
+                partial_update=not include_details,
             )
             cached_models = models_cache.get("available_models", {})
         else:
             cached_models = {}
 
         if not include_details:
-            return sorted(valid_models), "", None
+            result_ids = sorted(valid_models)
+            _models_result_cache_put(cache_key, result_ids, "")
+            return result_ids, "", None
 
         non_reasoning_groups: dict[str, list[tuple[str, str]]] = {}
         reasoning_groups: dict[str, list[tuple[str, str]]] = {}
@@ -325,9 +468,21 @@ async def fetch_mistral_models_ids(
         for info in valid_models.values():
             valid_ids_set.add(info["id"])
 
-        return sorted(valid_ids_set), details_text, None
+        result_ids = sorted(valid_ids_set)
+        _models_result_cache_put(cache_key, result_ids, details_text)
+        return result_ids, details_text, None
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError, TypeError, ValueError, RuntimeError) as e:
         err_text = str(e).strip()
         if not err_text:
             err_text = e.__class__.__name__
         return [], "", err_text
+
+async def prefetch_mistral_models_menu(api_key: Optional[str]) -> None:
+    if not api_key:
+        return
+    try:
+        await fetch_mistral_models_ids(api_key)
+    except asyncio.CancelledError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, TypeError, ValueError, RuntimeError):
+        pass

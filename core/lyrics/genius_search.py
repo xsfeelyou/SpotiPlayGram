@@ -8,11 +8,12 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 from typing import Optional, Dict, Any, List, Tuple, Set, Iterator, Iterable, Callable
 
-from logger import _safe_log_info, _safe_log_error
+from logger import _safe_log_info, _safe_log_error, _safe_log_warning
 from constants import (
     ERROR_AUTH_GENIUS_INVALID_TOKEN,
     ERROR_GENIUS_DETAILS_FAILED,
     ERROR_MISTRAL_FINAL_SELECTION,
+    ERROR_UNEXPECTED,
     GENIUS_ALBUM_MIN_TRACKS,
     GENIUS_DETAILS_TOP_N,
     GENIUS_FUZZY_CHARS_PERCENT,
@@ -54,6 +55,7 @@ from constants import (
     INFO_GENIUS_SEARCH_QUERY,
     INFO_GENIUS_TAG_FOUND_AND_FEAT_REMOVED_FROM_TRACK,
     INFO_GENIUS_TAG_FOUND_FROM_TRACK,
+    INFO_MISTRAL_FALLBACK,
     INFO_MISTRAL_FINAL_SELECTION_NONE,
     INFO_MISTRAL_FINAL_SELECTION_NONE_CACHED,
     INFO_MISTRAL_FINAL_SELECTION_NONE_INFLIGHT,
@@ -338,11 +340,11 @@ def _transform_by_mode(val: Optional[str], mode: str) -> str:
         return _concat_no_spaces(val)
     return _split_chars_spaced(val)
 
-@lru_cache(maxsize=32768)
+@lru_cache(maxsize=4096)
 def _transform_by_mode_cached(val: Optional[str], mode: str) -> str:
     return _transform_by_mode(val, mode)
 
-@lru_cache(maxsize=32768)
+@lru_cache(maxsize=4096)
 def _variant_mode_value_triplets_cached(
     primary_artist: Optional[str],
     featured_artists: Optional[str],
@@ -382,7 +384,7 @@ def _mode_triplet_value(values: Tuple[str, str, str], mode: Optional[str]) -> st
         return values[2]
     return values[0]
 
-@lru_cache(maxsize=32768)
+@lru_cache(maxsize=4096)
 def _build_mode_queries_cached(
     primary_artist: Optional[str],
     featured_artists: Optional[str],
@@ -768,7 +770,7 @@ def _album_match_score(spotify_album_name: Optional[str], spotify_album_total_tr
     if sp_name and g_name and _fuzzy_tokens_match_impl(_normalize_ws_tokens, sp_name, g_name, GENIUS_FUZZY_TOKENS_PERCENT, GENIUS_FUZZY_CHARS_PERCENT):
         score += GENIUS_SCORE_ALBUM_MATCH
         reasons.append(f"album_match +{GENIUS_SCORE_ALBUM_MATCH}")
-    else:
+    elif sp_name and g_name:
         score -= GENIUS_PENALTY_ALBUM_MISMATCH
         reasons.append(f"album_mismatch -{GENIUS_PENALTY_ALBUM_MISMATCH}")
     return score, reasons
@@ -786,6 +788,10 @@ def _title_matches(variant_track: str, genius_title: str) -> bool:
             continue
         for gt in gts:
             if not gt:
+                continue
+            if vt == gt:
+                return True
+            if len(vt) <= 3 or len(gt) <= 3:
                 continue
             if vt in gt or gt in vt:
                 return True
@@ -942,17 +948,17 @@ def _calc_title_featured_mismatch_penalty(spotify_track_name: Optional[str], tit
         for variants in [_spotify_text_variants(p)]
         if variants
     ]
-    best_penalty = 0
+    best_penalty: Optional[int] = None
     best_reasons: List[str] = []
     for track_value, featured_values in [
         (_safe_stripped(spotify_track_name), featured_pref_raw),
         ((_spotify_text_variants(spotify_track_name) or [""])[-1], featured_pref_anyascii),
     ]:
         current_penalty, current_reasons = _calc_penalty(track_value, featured_values)
-        if current_penalty > best_penalty or not best_reasons:
+        if best_penalty is None or current_penalty > best_penalty:
             best_penalty = current_penalty
             best_reasons = current_reasons
-    return best_penalty, best_reasons
+    return best_penalty if best_penalty is not None else 0, best_reasons
 
 def _slug_token_match_score(
     song: Dict[str, Any],
@@ -1054,7 +1060,7 @@ def _build_query_from_variant(v: Dict[str, Optional[str]]) -> str:
     q = _collapse_ws(" ".join(parts))
     return normalize_query_value(q) or ""
 
-@lru_cache(maxsize=32768)
+@lru_cache(maxsize=4096)
 def _build_query_from_variant_cached(
     primary_artist: Optional[str],
     featured_artists: Optional[str],
@@ -1109,10 +1115,9 @@ def _song_url(song: Dict[str, Any]) -> Optional[str]:
         return None
     url = song.get("url")
     if isinstance(url, str) and url:
-        if url.rstrip("/").lower().endswith("-lyrics"):
-            return url
         u = url.split("/q/", 1)[0]
-        if u.rstrip("/").lower().endswith("-lyrics"):
+        low = u.lower()
+        if "genius.com/" in low and "/albums/" not in low and "/artists/" not in low:
             return u
     return None
 
@@ -1188,7 +1193,7 @@ def _score_song_detailed(song: Dict[str, Any], variants: Iterable[Dict[str, Opti
     title_exact_norm = _norm_title_value(title, clear=True)
     featured_score, featured_reasons = _featured_match_score(featured_pref, song, title_with_feat)
 
-    best_var = 0
+    best_var: Optional[int] = None
     best_var_reasons: List[str] = []
     for v in variants_list:
         if not isinstance(v, dict):
@@ -1212,11 +1217,11 @@ def _score_song_detailed(song: Dict[str, Any], variants: Iterable[Dict[str, Opti
         v_reasons.extend(rreasons)
         v_add += featured_score
         v_reasons.extend(featured_reasons)
-        if v_add > best_var:
+        if best_var is None or v_add > best_var:
             best_var = v_add
             best_var_reasons = v_reasons
     mp, mpreasons = _calc_title_featured_mismatch_penalty(spotify_track_name, title_with_feat, featured_pref, song)
-    score += best_var + mp
+    score += (best_var or 0) + mp
     reasons_all.extend(best_var_reasons)
     reasons_all.extend(mpreasons)
 
@@ -1653,7 +1658,7 @@ def _expand_variant_fields_key(
         out.append(item_key)
     return tuple(out)
 
-@lru_cache(maxsize=32768)
+@lru_cache(maxsize=4096)
 def _expand_normalized_variant_fields_key_cached(
     primary_artist: Optional[str],
     featured_artists: Optional[str],
@@ -1670,7 +1675,7 @@ def _expand_normalized_variant_fields_key_cached(
         _normalized_field_variants_cached,
     )
 
-@lru_cache(maxsize=32768)
+@lru_cache(maxsize=4096)
 def _expand_symbolized_variant_fields_key_cached(
     primary_artist: Optional[str],
     featured_artists: Optional[str],
@@ -1687,7 +1692,7 @@ def _expand_symbolized_variant_fields_key_cached(
         _symbol_field_variants_cached,
     )
 
-@lru_cache(maxsize=32768)
+@lru_cache(maxsize=4096)
 def _expand_anyascii_variant_fields_key_cached(
     primary_artist: Optional[str],
     featured_artists: Optional[str],
@@ -1930,7 +1935,7 @@ def _build_genius_candidates_meta(
             "featured_artists": _meta_str(featured_text),
             "title": _meta_str(title_out),
             "version_tag": _meta_str(version_tag_out),
-            "album": _meta_str(album_name or title_out),
+            "album": _meta_str(album_name),
             "release_date": _meta_str(rel_date),
         }
         out.append(meta)
@@ -2550,8 +2555,13 @@ async def search_lyrics_url(track_name: str,
             task.cancel()
         try:
             await task
-        except BaseException:
-            pass
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            return
+        except Exception as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e)
 
     async def _finish_mistral_prefetch_task(*, cancel: bool) -> None:
         nonlocal mistral_prefetch_task
@@ -2570,7 +2580,7 @@ async def search_lyrics_url(track_name: str,
     featured_pref_list = list(rest_names)
     found_initial_tag_or_feat_placeholders = False
     full_track = track_name or ""
-    tag_from_track0, base0 = _extract_trailing_tag(full_track)
+    tag_from_track0, base0 = await asyncio.to_thread(_extract_trailing_tag, full_track)
     feats_before = detect_feat_placeholders_bracketed(full_track) or []
     feats_after = detect_feat_placeholders_bracketed(base0) or [] if base0 else []
     feats_removed = [f for f in feats_before if f not in feats_after]
@@ -2583,7 +2593,7 @@ async def search_lyrics_url(track_name: str,
             (normalize_query_value(f) or f) for f in feats_removed
         ) if feats_removed else ""
 
-        tag_pat0 = _remix_tag_matched_pattern(tag_from_track0) if tag_from_track0 else None
+        tag_pat0 = await asyncio.to_thread(_remix_tag_matched_pattern, tag_from_track0) if tag_from_track0 else None
         tag_pat_log0 = tag_pat0 or ""
 
         feat_pats: list[str] = []
@@ -2803,7 +2813,10 @@ async def search_lyrics_url(track_name: str,
             return
         try:
             variants_for_match_snapshot = match_variants_snapshot_task.result()
-        except BaseException:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e)
             match_variants_snapshot_task = None
             return
         variants_for_match = variants_for_match_snapshot
@@ -2922,8 +2935,9 @@ async def search_lyrics_url(track_name: str,
             return
         if sid in detail_prefetch_tasks:
             return
-        if len(detail_prefetch_tasks) >= limit_n and not prioritize:
-            return
+        if len(detail_prefetch_tasks) >= limit_n:
+            if not prioritize or len(detail_prefetch_tasks) >= limit_n * 4:
+                return
         detail_prefetch_tasks[sid] = asyncio.create_task(guarded_fetch(sid))
 
     async def _cancel_detail_prefetches(*, keep_ids: Optional[Set[int]] = None) -> None:
@@ -3064,7 +3078,8 @@ async def search_lyrics_url(track_name: str,
                             pass
                     await asyncio.gather(*search_tasks, return_exceptions=True)
                     raise
-                except BaseException:
+                except Exception as e:
+                    _safe_log_warning(ERROR_UNEXPECTED, e)
                     continue
 
                 if not isinstance(res, tuple) or len(res) != 3:
@@ -3077,8 +3092,10 @@ async def search_lyrics_url(track_name: str,
                         if on_phase_matched is not None:
                             try:
                                 on_phase_matched()
-                            except BaseException:
-                                pass
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                _safe_log_warning(ERROR_UNEXPECTED, e)
         except asyncio.CancelledError:
             for t in search_tasks:
                 try:
@@ -3208,7 +3225,8 @@ async def search_lyrics_url(track_name: str,
                     except asyncio.CancelledError:
                         await _cancel_outstanding()
                         raise
-                    except BaseException:
+                    except Exception as e:
+                        _safe_log_warning(ERROR_UNEXPECTED, e)
                         continue
                     if not isinstance(res, tuple) or len(res) != 3:
                         continue
@@ -3408,11 +3426,10 @@ async def search_lyrics_url(track_name: str,
             return None
 
         final_song = best_song
+        if mistral_enabled and not (scored_sorted and spotify_track_meta is not None and genius_candidates_meta is not None):
+            _safe_log_info(INFO_MISTRAL_FALLBACK)
+            mistral_enabled = False
         if mistral_enabled:
-            if not (scored_sorted and spotify_track_meta is not None and genius_candidates_meta is not None):
-                await _finish_mistral_prefetch_task(cancel=True)
-                _log_no_results()
-                return None
             idx_choice, explicit_none, choice_source = await choose_genius_candidate_with_mistral(
                 spotify_track_meta,
                 genius_candidates_meta,
@@ -3439,13 +3456,9 @@ async def search_lyrics_url(track_name: str,
                     ERROR_MISTRAL_FINAL_SELECTION,
                     f"idx out of range: {idx_choice} (candidates={len(scored_sorted)})",
                 )
-                await _finish_mistral_prefetch_task(cancel=True)
-                _log_no_results()
-                return None
+                _safe_log_info(INFO_MISTRAL_FALLBACK)
             else:
-                await _finish_mistral_prefetch_task(cancel=True)
-                _log_no_results()
-                return None
+                _safe_log_info(INFO_MISTRAL_FALLBACK)
 
         url = _resolve_song_url(final_song, details_by_id)
         await _finish_mistral_prefetch_task(cancel=True)
@@ -3457,7 +3470,8 @@ async def search_lyrics_url(track_name: str,
         await _cancel_match_payload_tasks()
         await _finish_mistral_prefetch_task(cancel=True)
         raise
-    except Exception:
+    except Exception as e:
+        _safe_log_error(ERROR_UNEXPECTED, e)
         await _cancel_match_payload_tasks()
         await _finish_mistral_prefetch_task(cancel=True)
         raise

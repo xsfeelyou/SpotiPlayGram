@@ -11,6 +11,11 @@ import aiohttp
 from spotipy import SpotifyOAuth
 from spotipy.cache_handler import CacheHandler
 
+from constants import (
+    ERROR_SPOTIFY_TOKEN_REFRESH,
+    ERROR_UNEXPECTED,
+)
+from logger import _safe_log_error, _safe_log_warning, dev_logger
 from .http_session import init_session
 
 class SPGCacheFileHandler(CacheHandler):
@@ -28,7 +33,13 @@ class SPGCacheFileHandler(CacheHandler):
                 return {}
             data = json.loads(raw)
             return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        except FileNotFoundError:
+            return {}
+        except OSError as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e, logger=dev_logger)
+            return {}
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e, logger=dev_logger)
             return {}
 
     def _write_cache_unlocked(self, data: dict[str, Any]) -> None:
@@ -37,14 +48,21 @@ class SPGCacheFileHandler(CacheHandler):
             if parent:
                 os.makedirs(parent, exist_ok=True)
             tmp_path = self.cache_path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(tmp_path, flags, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(json.dumps(data))
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
             os.replace(tmp_path, self.cache_path)
             try:
                 os.chmod(self.cache_path, 0o600)
             except OSError:
                 pass
-        except OSError:
+        except OSError as e:
+            _safe_log_warning(ERROR_UNEXPECTED, e, logger=dev_logger)
             return
 
     def get_cached_token(self):
@@ -113,6 +131,7 @@ class AsyncSpotifyClient:
         self._token_lock = asyncio.Lock()
         self._token_refresh_margin = 60.0
         self._token_fallback_ttl = 300.0
+        self._token_refresh_next_ts = 0.0
 
     def _cached_token_valid(self, now: float) -> bool:
         return bool(self._access_token and self._access_token_expires_at > now + self._token_refresh_margin)
@@ -140,7 +159,10 @@ class AsyncSpotifyClient:
             return "", 0.0
         try:
             cached_token = await asyncio.to_thread(get_cached_token)
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _safe_log_error(ERROR_SPOTIFY_TOKEN_REFRESH, e, logger=dev_logger)
             return "", 0.0
         if not isinstance(cached_token, dict):
             return "", 0.0
@@ -152,7 +174,10 @@ class AsyncSpotifyClient:
             return "", 0.0
         try:
             token = await asyncio.to_thread(refresh_access_token, refresh_token)
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _safe_log_error(ERROR_SPOTIFY_TOKEN_REFRESH, e, logger=dev_logger)
             return "", 0.0
         return self._extract_token_data(token, now)
 
@@ -162,21 +187,36 @@ class AsyncSpotifyClient:
             token, expires_at = await self._refresh_access_token(now)
             if token:
                 return token, expires_at
+            self._token_refresh_next_ts = now + 60.0
             return "", 0.0
         try:
-            token = await asyncio.to_thread(self._auth.get_access_token, as_dict=True)
-        except TypeError:
-            token = await asyncio.to_thread(self._auth.get_access_token)
-        return self._extract_token_data(token, now)
+            try:
+                token = await asyncio.to_thread(self._auth.get_access_token, as_dict=True)
+            except TypeError:
+                token = await asyncio.to_thread(self._auth.get_access_token)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _safe_log_error(ERROR_SPOTIFY_TOKEN_REFRESH, e, logger=dev_logger)
+            self._token_refresh_next_ts = now + 60.0
+            return "", 0.0
+        result = self._extract_token_data(token, now)
+        if not result[0]:
+            self._token_refresh_next_ts = now + 60.0
+        return result
 
     async def _get_access_token(self, *, force_refresh: bool = False) -> str:
         now = time.time()
         if not force_refresh and self._cached_token_valid(now):
             return self._access_token
+        if force_refresh and now < self._token_refresh_next_ts:
+            return ""
         async with self._token_lock:
             now = time.time()
             if not force_refresh and self._cached_token_valid(now):
                 return self._access_token
+            if force_refresh and now < self._token_refresh_next_ts:
+                return ""
             token, expires_at = await self._load_access_token(force_refresh=force_refresh)
             self._access_token = token
             self._access_token_expires_at = expires_at
